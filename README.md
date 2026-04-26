@@ -4,8 +4,14 @@
 prefill/decode execution, checkpoint-backed KV handoff, and tensor-parallel
 worker coordination.
 
-This repository contains the engine library only. It does not include a control
-plane service, product UI, billing, or operator workflows.
+We built our own inference engine because Mesh needs explicit serving sessions,
+prefill/decode separation, checkpoint-backed KV handoff, and distributed
+tensor-parallel execution as a first-class worker boundary. 
+
+The goal is higher usable throughput and better steady-state `tok/s` for sharded models across multiple workers.
+
+In the larger Mesh project, `zip` is the worker-side execution runtime beneath the
+control plane, scheduler, and product surfaces.
 
 ## Scope
 
@@ -20,13 +26,6 @@ plane service, product UI, billing, or operator workflows.
 - ring collective execution primitives
 - device capability, connectivity, and identity helpers
 - model shard metadata and artifact loading
-
-`zip` currently does not provide:
-
-- a standalone scheduler service
-- control-plane persistence or lease management
-- product CLI or local desktop UI
-- billing, accounting, or multi-tenant policy layers
 
 ## Repository Layout
 
