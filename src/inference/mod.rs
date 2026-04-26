@@ -1,0 +1,74 @@
+//! zip inference engine module for tensor-parallel distributed inference
+//!
+//! This module provides the core `zip` orchestration layer for running distributed inference
+//! across a ring of workers using tensor parallelism. Each worker:
+//!
+//! 1. Holds a shard (column range) of the model weights
+//! 2. Computes partial matrix multiplications for their columns
+//! 3. Participates in ring all-reduce to combine results
+//! 4. Produces identical full activations across all workers
+//!
+//! ## Architecture
+//!
+//! ```text
+//! Control Plane
+//!       │
+//!       ▼ (inference request)
+//! ┌─────────────────────────────────────────┐
+//! │         InferenceCoordinator            │
+//! │  • Receives jobs from control plane     │
+//! │  • Manages inference lifecycle          │
+//! │  • Coordinates checkpointing            │
+//! └─────────────────────────────────────────┘
+//!       │
+//!       ▼ (per layer)
+//! ┌─────────────────────────────────────────┐
+//! │         Forward Pass (per layer)        │
+//! │  1. Compute partial matmul (my shard)   │
+//! │  2. Ring all-reduce with neighbors      │
+//! │  3. Apply activation function           │
+//! │  4. Repeat for next layer               │
+//! └─────────────────────────────────────────┘
+//! ```
+//!
+//! ## Key Components
+//!
+//! - [`InferenceCoordinator`]: Main orchestrator for `zip` inference jobs
+//! - [`InferenceJob`]: Represents a single inference request
+//! - [`InferenceStats`]: Tracks inference performance metrics
+//! - [`tensor_ops`]: Tensor operations (matmul, activations, etc.)
+//! - [`kv_cache`]: KV cache management for transformer attention
+//! - [`forward_pass`]: Tensor-parallel forward pass implementation
+//! - [`artifact_loader`]: Verified safetensors shard loading
+
+pub mod artifact_loader;
+pub mod backend;
+pub mod coordinator;
+pub mod engine;
+pub mod forward_pass;
+pub mod job;
+pub mod kv_cache;
+pub mod stats;
+pub mod tensor_ops;
+
+pub use artifact_loader::{ArtifactShardLoader, ShardLoader};
+pub use backend::{
+    BackendMicrobatchExecutor, CandleExecutionBackend, DecodeMicrobatchOutput,
+    DecodeMicrobatchRequest, ExecutionBackend,
+};
+pub use coordinator::{InferenceConfig, InferenceCoordinator};
+pub use engine::{
+    BackendInstanceSpec, BackendOptimizationProfile, DecodeBatchPlan, DecodeBatchPolicy,
+    DecodeBatchSlot, DecodeTask, EngineSessionState, ExecutionPhase, InferenceRuntimeMode,
+    KvTransferPolicy, RuntimeMemoryBudget, SessionAssignment, SessionEvictionReason,
+    SessionEvictionState, SessionPauseReason, SessionPauseState, SessionRuntimeStatus,
+    TransportCapabilityTier,
+};
+pub use forward_pass::{ForwardPass, LayerWeights, ModelWeights};
+pub use job::{
+    DecodeBatchTargets, GenerationConfig, InferenceJob, InferenceProgressUpdate, InferenceRequest,
+    InferenceResult, SegmentExecutionResult,
+};
+pub use kv_cache::{KVCache, KVCacheConfig, LayerKVCache};
+pub use stats::InferenceStats;
+pub use tensor_ops::{Tensor1D, Tensor2D};

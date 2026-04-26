@@ -1,0 +1,65 @@
+[package]
+name = "zip"
+version = "0.1.0"
+authors = ["Aria Compute Company"]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/ariacomputecompany/zip"
+description = "Distributed inference engine runtime for explicit sessions, decode batching, checkpoint handoff, and tensor-parallel serving."
+keywords = ["inference", "distributed-systems", "llm", "tensor-parallel", "runtime"]
+categories = ["science", "concurrency", "network-programming"]
+
+[lib]
+name = "zip"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1.47", features = ["full"] }
+libp2p = { version = "0.56", features = ["tcp", "quic", "noise", "yamux", "relay", "dcutr", "identify", "request-response", "macros", "tokio"] }
+futures = "0.3"
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+ciborium = "0.2"
+ed25519-dalek = "2.1"
+multibase = "0.9"
+sha2 = "0.10"
+hex = "0.4"
+uuid = { version = "1.11", features = ["v4", "serde"] }
+anyhow = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+sysinfo = "0.30"
+dirs = "5.0"
+rand = "0.8"
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+colored = "2.1"
+chrono = "0.4"
+socket2 = "0.5"
+safetensors = "0.7"
+tokenizers = "0.20"
+candle-core = "0.10.2"
+candle-nn = "0.10.2"
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+candle-core = { version = "0.10.2", features = ["cuda"] }
+candle-nn = { version = "0.10.2", features = ["cuda"] }
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+candle-core = { version = "0.10.2", features = ["metal"] }
+candle-nn = { version = "0.10.2", features = ["metal"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_System_Memory"] }
+
+[dev-dependencies]
+tempfile = "3.8"
+quickcheck = "1.0"
+quickcheck_macros = "1.0"
+serial_test = "3.2"
