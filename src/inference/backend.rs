@@ -1,51 +1,80 @@
 use async_trait::async_trait;
+use std::any::Any;
 use std::time::Instant;
 use uuid::Uuid;
 
 use crate::errors::Result;
 use crate::executor::ring_allreduce::{RingAllReduceMetrics, WorkerRing};
 use crate::provider::{selected_execution_provider, ExecutionProviderKind};
+use candle_core::Tensor as CandleTensor;
 
-use super::engine::BackendOptimizationProfile;
-use super::forward_pass::{ForwardPass, ModelWeights};
+use super::engine::{BackendOptimizationProfile, LocalExecutorContract};
+use super::fast_path::{FastPathBackendContext, FastPathExecutionPlan, FastPathPlanner};
+use std::sync::Arc;
+
+use super::forward_pass::{ForwardPass, SharedModelResidency};
 use super::kv_cache::KVCacheSnapshot;
 use super::tensor_ops::Tensor1D;
 
+#[derive(Clone)]
+pub enum BackendLogits {
+    Host(Tensor1D),
+    Device(CandleTensor),
+}
+
 #[async_trait]
 pub trait ExecutionBackend: Send {
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+
     fn provider_kind(&self) -> ExecutionProviderKind;
 
     fn optimization_profile(&self) -> BackendOptimizationProfile;
+
+    fn executor_contract(&self) -> &LocalExecutorContract;
 
     async fn prefill(
         &mut self,
         tokens: &[u32],
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
-    ) -> Result<Tensor1D>;
+    ) -> Result<BackendLogits>;
 
     async fn decode_step(
         &mut self,
         token: u32,
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
-    ) -> Result<Tensor1D>;
+    ) -> Result<BackendLogits>;
 
-    fn sample(&self, logits: &Tensor1D, temperature: f32, top_p: f32, seed: u64) -> u32;
+    fn sample(
+        &self,
+        logits: &BackendLogits,
+        temperature: f32,
+        top_p: f32,
+        seed: u64,
+    ) -> Result<u32>;
 
     fn cache_seq_len(&self) -> usize;
 
-    fn cache_memory_usage(&self) -> usize;
+    fn live_kv_cache_bytes(&self) -> usize;
+
+    fn logical_kv_tokens(&self) -> usize;
 
     fn sequence_position(&self) -> usize;
 
     fn last_allreduce_metrics(&self) -> RingAllReduceMetrics;
 
-    fn export_kv_cache(&self) -> Result<Option<KVCacheSnapshot>>;
+    fn export_kv_cache(&self, max_cached_tokens: Option<usize>) -> Result<Option<KVCacheSnapshot>>;
 
     fn import_kv_cache(&mut self, snapshot: &KVCacheSnapshot) -> Result<()>;
 
     fn clear(&mut self);
+
+    fn fast_path_context(&self) -> FastPathBackendContext;
+
+    fn supports_decode_microbatch(&self) -> bool {
+        self.executor_contract().supports_decode_microbatch()
+    }
 }
 
 pub struct DecodeMicrobatchRequest<'a> {
@@ -57,7 +86,7 @@ pub struct DecodeMicrobatchRequest<'a> {
 
 pub struct DecodeMicrobatchOutput {
     pub session_id: Uuid,
-    pub logits: Tensor1D,
+    pub logits: BackendLogits,
     pub execution_time_ms: u64,
 }
 
@@ -66,8 +95,21 @@ pub struct BackendMicrobatchExecutor;
 impl BackendMicrobatchExecutor {
     pub async fn decode_step_batch(
         requests: &mut [DecodeMicrobatchRequest<'_>],
+        plan: Option<&FastPathExecutionPlan>,
         worker_ring: &mut WorkerRing<'_>,
     ) -> Result<Vec<DecodeMicrobatchOutput>> {
+        if let Some(plan) = plan {
+            let contexts = requests
+                .iter()
+                .map(|request| request.backend.fast_path_context())
+                .collect::<Vec<_>>();
+            FastPathPlanner::validate_decode_contexts(plan, &contexts)?;
+        }
+
+        if !Self::can_use_accelerated_decode_batch(requests) {
+            return Self::decode_step_batch_serial(requests, worker_ring).await;
+        }
+
         let profile = requests
             .first()
             .map(|request| request.backend.optimization_profile())
@@ -84,6 +126,28 @@ impl BackendMicrobatchExecutor {
                 Self::decode_step_batch_accelerated(requests, worker_ring).await
             }
         }
+    }
+
+    fn can_use_accelerated_decode_batch(requests: &[DecodeMicrobatchRequest<'_>]) -> bool {
+        let Some(first_request) = requests.first() else {
+            return true;
+        };
+
+        if !first_request.backend.supports_decode_microbatch() {
+            return false;
+        }
+
+        let profile = first_request.backend.optimization_profile();
+        if matches!(profile, BackendOptimizationProfile::CpuSerial) {
+            return false;
+        }
+
+        let contract = first_request.backend.executor_contract().clone();
+        requests.iter().all(|request| {
+            request.backend.supports_decode_microbatch()
+                && request.backend.optimization_profile() == profile
+                && request.backend.executor_contract() == &contract
+        })
     }
 
     async fn decode_step_batch_serial(
@@ -110,30 +174,38 @@ impl BackendMicrobatchExecutor {
         requests: &mut [DecodeMicrobatchRequest<'_>],
         worker_ring: &mut WorkerRing<'_>,
     ) -> Result<Vec<DecodeMicrobatchOutput>> {
-        // Provider-specialized fast paths keep the same runtime API while
-        // allowing Metal/CUDA backends to swap in fused kernels later.
+        if let Some(outputs) =
+            CandleExecutionBackend::decode_step_batch(requests, worker_ring).await?
+        {
+            return Ok(outputs);
+        }
         Self::decode_step_batch_serial(requests, worker_ring).await
     }
 }
 
 pub struct CandleExecutionBackend {
-    provider: ExecutionProviderKind,
-    forward_pass: ForwardPass,
+    pub(crate) model_id: String,
+    pub(crate) provider: ExecutionProviderKind,
+    pub(crate) executor_contract: LocalExecutorContract,
+    pub(crate) forward_pass: ForwardPass,
 }
 
 impl CandleExecutionBackend {
     pub fn new(
-        weights: ModelWeights,
+        model: Arc<SharedModelResidency>,
         worker_position: u32,
         shard_start: usize,
         shard_end: usize,
         total_workers: u32,
         allreduce_timeout: std::time::Duration,
     ) -> Result<Self> {
+        let provider = selected_execution_provider().unwrap_or(ExecutionProviderKind::Cpu);
         Ok(Self {
-            provider: selected_execution_provider().unwrap_or(ExecutionProviderKind::Cpu),
-            forward_pass: ForwardPass::new(
-                weights,
+            model_id: model.model_id().to_string(),
+            provider,
+            executor_contract: LocalExecutorContract::for_provider(provider),
+            forward_pass: ForwardPass::from_residency(
+                model,
                 worker_position,
                 shard_start,
                 shard_end,
@@ -142,20 +214,105 @@ impl CandleExecutionBackend {
             )?,
         })
     }
+
+    async fn decode_step_batch(
+        requests: &mut [DecodeMicrobatchRequest<'_>],
+        worker_ring: &mut WorkerRing<'_>,
+    ) -> Result<Option<Vec<DecodeMicrobatchOutput>>> {
+        if requests.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+
+        let mut backends = Vec::with_capacity(requests.len());
+        let mut session_ids = Vec::with_capacity(requests.len());
+        let mut job_ids = Vec::with_capacity(requests.len());
+        let mut tokens = Vec::with_capacity(requests.len());
+        let mut expected_model_id = None::<String>;
+        let mut expected_provider = None::<ExecutionProviderKind>;
+        let mut expected_contract = None::<LocalExecutorContract>;
+
+        for request in requests.iter_mut() {
+            let Some(backend) = request
+                .backend
+                .as_any_mut()
+                .downcast_mut::<CandleExecutionBackend>()
+            else {
+                return Ok(None);
+            };
+
+            if backend.forward_pass.position == 0 {
+                return Ok(None);
+            }
+
+            if let Some(model_id) = &expected_model_id {
+                if model_id != &backend.model_id {
+                    return Ok(None);
+                }
+            } else {
+                expected_model_id = Some(backend.model_id.clone());
+            }
+
+            if let Some(provider) = expected_provider {
+                if provider != backend.provider {
+                    return Ok(None);
+                }
+            } else {
+                expected_provider = Some(backend.provider);
+            }
+
+            if !backend.supports_decode_microbatch() {
+                return Ok(None);
+            }
+
+            if let Some(contract) = &expected_contract {
+                if contract != &backend.executor_contract {
+                    return Ok(None);
+                }
+            } else {
+                expected_contract = Some(backend.executor_contract.clone());
+            }
+
+            backends.push(backend);
+            session_ids.push(request.session_id);
+            job_ids.push(request.job_id);
+            tokens.push(request.token);
+        }
+
+        let step_start = Instant::now();
+        let logits =
+            ForwardPass::decode_microbatch(&mut backends, &tokens, &job_ids, worker_ring).await?;
+        let execution_time_ms = step_start.elapsed().as_millis() as u64;
+
+        Ok(Some(
+            session_ids
+                .into_iter()
+                .zip(logits)
+                .map(|(session_id, logits)| DecodeMicrobatchOutput {
+                    session_id,
+                    logits,
+                    execution_time_ms,
+                })
+                .collect(),
+        ))
+    }
 }
 
 #[async_trait]
 impl ExecutionBackend for CandleExecutionBackend {
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
     fn provider_kind(&self) -> ExecutionProviderKind {
         self.provider
     }
 
     fn optimization_profile(&self) -> BackendOptimizationProfile {
-        match self.provider {
-            ExecutionProviderKind::Cpu => BackendOptimizationProfile::CpuSerial,
-            ExecutionProviderKind::Metal => BackendOptimizationProfile::MetalVectorized,
-            ExecutionProviderKind::Cuda => BackendOptimizationProfile::CudaFused,
-        }
+        self.executor_contract.optimization_profile
+    }
+
+    fn executor_contract(&self) -> &LocalExecutorContract {
+        &self.executor_contract
     }
 
     async fn prefill(
@@ -163,7 +320,7 @@ impl ExecutionBackend for CandleExecutionBackend {
         tokens: &[u32],
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
-    ) -> Result<Tensor1D> {
+    ) -> Result<BackendLogits> {
         self.forward_pass.prefill(tokens, worker_ring, job_id).await
     }
 
@@ -172,13 +329,19 @@ impl ExecutionBackend for CandleExecutionBackend {
         token: u32,
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
-    ) -> Result<Tensor1D> {
+    ) -> Result<BackendLogits> {
         self.forward_pass
             .decode_step(token, worker_ring, job_id)
             .await
     }
 
-    fn sample(&self, logits: &Tensor1D, temperature: f32, top_p: f32, seed: u64) -> u32 {
+    fn sample(
+        &self,
+        logits: &BackendLogits,
+        temperature: f32,
+        top_p: f32,
+        seed: u64,
+    ) -> Result<u32> {
         self.forward_pass.sample(logits, temperature, top_p, seed)
     }
 
@@ -186,8 +349,12 @@ impl ExecutionBackend for CandleExecutionBackend {
         self.forward_pass.cache_seq_len()
     }
 
-    fn cache_memory_usage(&self) -> usize {
-        self.forward_pass.cache_memory_usage()
+    fn live_kv_cache_bytes(&self) -> usize {
+        self.forward_pass.live_kv_cache_bytes()
+    }
+
+    fn logical_kv_tokens(&self) -> usize {
+        self.forward_pass.logical_kv_tokens()
     }
 
     fn sequence_position(&self) -> usize {
@@ -198,35 +365,26 @@ impl ExecutionBackend for CandleExecutionBackend {
         self.forward_pass.last_allreduce_metrics
     }
 
-    fn export_kv_cache(&self) -> Result<Option<KVCacheSnapshot>> {
-        if self.forward_pass.kv_cache.seq_len() == 0 {
-            return Ok(None);
-        }
-        KVCacheSnapshot::from_cache(
-            &self.forward_pass.kv_cache,
-            self.forward_pass.position as u32,
-        )
-        .map(Some)
+    fn export_kv_cache(&self, max_cached_tokens: Option<usize>) -> Result<Option<KVCacheSnapshot>> {
+        self.forward_pass
+            .export_kv_cache_snapshot(max_cached_tokens)
     }
 
     fn import_kv_cache(&mut self, snapshot: &KVCacheSnapshot) -> Result<()> {
-        snapshot.validate()?;
-        let kv_cache = snapshot.decode_cache()?;
-        if kv_cache.seq_len() as u32 != snapshot.sequence.cached_tokens {
-            return Err(crate::errors::AgentError::Execution(format!(
-                "Recovered KV cache length {} does not match snapshot cached token count {}",
-                kv_cache.seq_len(),
-                snapshot.sequence.cached_tokens
-            )));
-        }
-        let sequence_position = snapshot.sequence.next_position as usize;
-        self.forward_pass.kv_cache = kv_cache;
-        self.forward_pass.position = sequence_position;
-        Ok(())
+        self.forward_pass.import_kv_cache_snapshot(snapshot)
     }
 
     fn clear(&mut self) {
         self.forward_pass.clear_cache();
+    }
+
+    fn fast_path_context(&self) -> FastPathBackendContext {
+        FastPathBackendContext {
+            provider: self.provider,
+            optimization_profile: self.optimization_profile(),
+            model_id: Some(self.model_id.clone()),
+            logical_kv_tokens: self.logical_kv_tokens(),
+        }
     }
 }
 
@@ -236,20 +394,25 @@ mod tests {
 
     struct ProfileBackend {
         provider: ExecutionProviderKind,
+        contract: LocalExecutorContract,
     }
 
     #[async_trait]
     impl ExecutionBackend for ProfileBackend {
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+
         fn provider_kind(&self) -> ExecutionProviderKind {
             self.provider
         }
 
         fn optimization_profile(&self) -> BackendOptimizationProfile {
-            match self.provider {
-                ExecutionProviderKind::Cpu => BackendOptimizationProfile::CpuSerial,
-                ExecutionProviderKind::Metal => BackendOptimizationProfile::MetalVectorized,
-                ExecutionProviderKind::Cuda => BackendOptimizationProfile::CudaFused,
-            }
+            self.contract.optimization_profile
+        }
+
+        fn executor_contract(&self) -> &LocalExecutorContract {
+            &self.contract
         }
 
         async fn prefill(
@@ -257,8 +420,8 @@ mod tests {
             _tokens: &[u32],
             _worker_ring: &mut WorkerRing<'_>,
             _job_id: Uuid,
-        ) -> Result<Tensor1D> {
-            Ok(Tensor1D::zeros(1))
+        ) -> Result<BackendLogits> {
+            Ok(BackendLogits::Host(Tensor1D::zeros(1)))
         }
 
         async fn decode_step(
@@ -266,19 +429,29 @@ mod tests {
             _token: u32,
             _worker_ring: &mut WorkerRing<'_>,
             _job_id: Uuid,
-        ) -> Result<Tensor1D> {
-            Ok(Tensor1D::zeros(1))
+        ) -> Result<BackendLogits> {
+            Ok(BackendLogits::Host(Tensor1D::zeros(1)))
         }
 
-        fn sample(&self, _logits: &Tensor1D, _temperature: f32, _top_p: f32, _seed: u64) -> u32 {
-            0
+        fn sample(
+            &self,
+            _logits: &BackendLogits,
+            _temperature: f32,
+            _top_p: f32,
+            _seed: u64,
+        ) -> Result<u32> {
+            Ok(0)
         }
 
         fn cache_seq_len(&self) -> usize {
             0
         }
 
-        fn cache_memory_usage(&self) -> usize {
+        fn live_kv_cache_bytes(&self) -> usize {
+            0
+        }
+
+        fn logical_kv_tokens(&self) -> usize {
             0
         }
 
@@ -290,7 +463,10 @@ mod tests {
             RingAllReduceMetrics::default()
         }
 
-        fn export_kv_cache(&self) -> Result<Option<KVCacheSnapshot>> {
+        fn export_kv_cache(
+            &self,
+            _max_cached_tokens: Option<usize>,
+        ) -> Result<Option<KVCacheSnapshot>> {
             Ok(None)
         }
 
@@ -299,30 +475,106 @@ mod tests {
         }
 
         fn clear(&mut self) {}
+
+        fn fast_path_context(&self) -> FastPathBackendContext {
+            FastPathBackendContext {
+                provider: self.provider,
+                optimization_profile: self.optimization_profile(),
+                model_id: Some(format!("test-{}", self.provider.as_str())),
+                logical_kv_tokens: 0,
+            }
+        }
     }
 
     #[test]
     fn backend_optimization_profile_tracks_provider_kind() {
         assert_eq!(
             ProfileBackend {
-                provider: ExecutionProviderKind::Cpu
+                provider: ExecutionProviderKind::Cpu,
+                contract: LocalExecutorContract::for_provider(ExecutionProviderKind::Cpu),
             }
             .optimization_profile(),
             BackendOptimizationProfile::CpuSerial
         );
         assert_eq!(
             ProfileBackend {
-                provider: ExecutionProviderKind::Metal
+                provider: ExecutionProviderKind::Metal,
+                contract: LocalExecutorContract::for_provider(ExecutionProviderKind::Metal),
             }
             .optimization_profile(),
             BackendOptimizationProfile::MetalVectorized
         );
         assert_eq!(
             ProfileBackend {
-                provider: ExecutionProviderKind::Cuda
+                provider: ExecutionProviderKind::Cuda,
+                contract: LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
             }
             .optimization_profile(),
             BackendOptimizationProfile::CudaFused
         );
+    }
+
+    #[test]
+    fn backend_executor_contract_assigns_fast_path_only_to_accelerated_providers() {
+        let cpu = LocalExecutorContract::for_provider(ExecutionProviderKind::Cpu);
+        let metal = LocalExecutorContract::for_provider(ExecutionProviderKind::Metal);
+        let cuda = LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda);
+
+        assert!(!cpu.is_fast_path());
+        assert!(!cpu.supports_decode_microbatch());
+        assert!(metal.is_fast_path());
+        assert!(metal.supports_decode_microbatch());
+        assert!(cuda.is_fast_path());
+        assert!(cuda.supports_decode_microbatch());
+    }
+
+    #[test]
+    fn accelerated_decode_batch_requires_homogeneous_fast_path_contracts() {
+        let mut metal_a = ProfileBackend {
+            provider: ExecutionProviderKind::Metal,
+            contract: LocalExecutorContract::for_provider(ExecutionProviderKind::Metal),
+        };
+        let mut metal_b = ProfileBackend {
+            provider: ExecutionProviderKind::Metal,
+            contract: LocalExecutorContract::for_provider(ExecutionProviderKind::Metal),
+        };
+        let mut cpu = ProfileBackend {
+            provider: ExecutionProviderKind::Cpu,
+            contract: LocalExecutorContract::for_provider(ExecutionProviderKind::Cpu),
+        };
+
+        let fast_requests = vec![
+            DecodeMicrobatchRequest {
+                session_id: Uuid::nil(),
+                job_id: Uuid::nil(),
+                token: 1,
+                backend: &mut metal_a,
+            },
+            DecodeMicrobatchRequest {
+                session_id: Uuid::new_v4(),
+                job_id: Uuid::new_v4(),
+                token: 2,
+                backend: &mut metal_b,
+            },
+        ];
+        assert!(BackendMicrobatchExecutor::can_use_accelerated_decode_batch(
+            &fast_requests
+        ));
+
+        let mixed_requests = vec![
+            DecodeMicrobatchRequest {
+                session_id: Uuid::nil(),
+                job_id: Uuid::nil(),
+                token: 1,
+                backend: &mut metal_a,
+            },
+            DecodeMicrobatchRequest {
+                session_id: Uuid::new_v4(),
+                job_id: Uuid::new_v4(),
+                token: 2,
+                backend: &mut cpu,
+            },
+        ];
+        assert!(!BackendMicrobatchExecutor::can_use_accelerated_decode_batch(&mixed_requests));
     }
 }

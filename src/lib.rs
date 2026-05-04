@@ -17,8 +17,8 @@ pub mod telemetry;
 
 pub use api::RegistrationClient;
 pub use checkpoint::{
-    Checkpoint, CheckpointConfig, CheckpointManager, CheckpointMetadata, KVCacheHandoff,
-    KVCacheResidency, KVPayloadRef,
+    Checkpoint, CheckpointConfig, CheckpointManager, CheckpointMetadata, CheckpointRecoveryPoint,
+    KVCacheHandoff, KVCacheResidency, KVPayloadRef,
 };
 pub use connectivity::{
     build_direct_peer_candidates, build_direct_peer_candidates_from_records,
@@ -31,7 +31,7 @@ pub use connectivity::{
     DirectPeerCandidate, NetworkConnectivity,
 };
 pub use device::{DeviceCapabilities, DeviceConfig, Tier};
-pub use errors::{AgentError, AgentError as ZipError, Result};
+pub use errors::{AgentError, Result};
 pub use executor::{Tensor, WorkerRing};
 pub use inference::{
     GenerationConfig, InferenceConfig, InferenceCoordinator, InferenceJob, InferenceRequest,
@@ -40,8 +40,9 @@ pub use inference::{
 pub use model::{ModelInfo, ShardAssignment, ShardInfo, ShardRegistry, ShardStatus};
 pub use network::{
     parse_data_plane_endpoint, parse_tensor_plane_advertised_addr_env,
-    parse_tensor_plane_bind_addr_env, AllReducePhase, ConnectionInfo, ConnectionType, MeshEvent,
-    MeshSwarm, MeshSwarmBuilder, MeshSwarmConfig, RingConnections, TensorMessage, TensorPlane,
+    parse_tensor_plane_bind_addr_env, AllReducePhase, CollectiveLane, ConnectionInfo,
+    ConnectionType, MeshEvent, MeshSwarm, MeshSwarmBuilder, MeshSwarmConfig, RingConnections,
+    ServingFrame, ServingFrameHeader, ServingReceiveSpec, ServingSessionTransport, TensorPlane,
     TensorPlaneCapabilitiesSnapshot, TensorPlaneConfig, TensorPlaneMetricsSnapshot,
     TensorPlaneProfile, TensorTrafficClass, TransportFallbackPolicy,
 };
