@@ -8,10 +8,12 @@ Included here:
 
 - runtime coordination
 - execution backend boundary
+- fast-path planning and decode admission policy
 - checkpoint and KV handoff logic
 - transport and collective execution primitives
 - model/shard metadata
 - worker protocol client types
+- runtime telemetry and observability helpers
 
 Intentionally not included here:
 
@@ -34,6 +36,11 @@ Intentionally not included here:
 - Describe missing pieces as out of scope, not as implied features.
 - Keep terminology consistent with the code: sessions, prefill, decode,
   checkpoints, KV, tensor plane, collective execution.
+- Keep public docs aligned with the current collective transport model:
+  collective IDs, lane plans, stream IDs, slot mailboxes, and direct-byte
+  payload paths.
+- Describe accelerated decode in terms of explicit contracts, stable buckets,
+  workspace limits, and provider-aware guardrails.
 
 ## Security and Hygiene
 
@@ -47,6 +54,7 @@ Intentionally not included here:
 Expected local verification for library changes:
 
 ```bash
+cargo fmt --check
 cargo check
 cargo test
 ```

@@ -247,8 +247,18 @@ than the generic fallback path. Fast-path decode requires:
 - a KV runtime contract that requires paged live KV and append-only decode
 - a bucket/workspace plan that validates against the live session metadata
 
-That narrow contract is deliberate. It keeps the hot path explicit and
-measurable instead of silently widening into a “best effort” execution mode.
+That narrow contract is deliberate. It keeps the hot path explicit,
+measurable, and contract-driven.
+
+The current fast-path decode implementation also keeps the execution shape
+stable through:
+
+- decode token ceilings derived from backend context
+- microbatch bucket cohesion checks
+- KV-skew guardrails for throughput-oriented decode policies
+- batch-local collective identity for multi-session decode steps
+- batched logits retention through device-side sampling when session sampling
+  parameters align
 
 ## Backend Boundary
 
@@ -365,6 +375,11 @@ The transport path now has a more explicit serving-lane model:
 - bulk-transfer lane
 - checkpoint lane
 
+Each lane is paired with a stable logical `stream_id` plan derived from the
+ring topology, lane class, worker count, and collective step. The serving
+transport binds those logical streams to durable peer channels so decode
+traffic can reuse warmed channels with hot-path-stable transport state.
+
 The collective layer can describe whether a given lane is:
 
 - a blocking stage boundary
@@ -374,6 +389,47 @@ The collective layer can describe whether a given lane is:
 That gives the worker runtime a way to overlap checkpoint/bulk transfers with
 decode where safe, while still draining those background transfers before
 blocking collective boundaries when correctness requires it.
+
+The serving dataplane itself is structured around collective-native identities:
+
+- collectives are keyed by collective ID, lane, phase, step, slot, and expected
+  sender position
+- inbound frames are routed into slot-owned mailboxes
+- waiter wakeups are scoped to the exact slot that became ready
+- larger-ring traffic can progress concurrently across distinct slots without a
+  single global inbound receive bottleneck
+
+The wire path is intentionally collective-native as well:
+
+- serving frames carry fixed-size collective headers
+- transport payloads use direct little-endian `f32` wire bytes
+- matrix and tensor collectives consume received bytes directly in the
+  all-reduce path
+- 2-worker decode all-reduce uses a single-exchange specialization
+- larger rings use cached collective step plans and cached chunk layouts
+
+This keeps the transport and collective path aligned with the execution model
+and collective semantics of the runtime.
+
+## Decode Executor Shape
+
+The current decode executor emphasizes stable execution shape and low transport
+overhead.
+
+Important properties include:
+
+- fused QKV projection and fused gate/up projection in the decode path
+- paged live-KV execution with explicit transfer/checkpoint seams
+- pooled Metal collective staging scratch with rotating slots and reset-time
+  release
+- dedicated batch-local collective workspace for microbatch decode
+- direct-byte collective application in both matrix and generic tensor paths
+- reusable serving transport plans cached against ring topology and backend
+  class
+
+These choices keep the worker runtime explicit about where cost comes from:
+local executor math, collective transport, decode admission policy, or
+checkpoint/recovery behavior.
 
 ## Control-Plane Interaction Model
 
@@ -418,13 +474,14 @@ The runtime now records surfaces such as:
 - deferred-session counts per microbatch
 - arena reuse
 - transport bytes and wait times
+- send-side and receive-side collective wait breakdowns
 - collective wait-share metrics
 - collective transport share of runtime
 - checkpoint and recovery counters
 - recovery success and rejection rates
 
 This keeps the worker runtime observable enough to support real benchmark and
-regression analysis instead of only pass/fail testing.
+regression analysis beyond simple pass/fail testing.
 
 ## Client Protocol Surface
 

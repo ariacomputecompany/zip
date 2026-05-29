@@ -8,7 +8,8 @@ We built our own inference engine because Mesh needs explicit serving sessions,
 prefill/decode separation, checkpoint-backed KV handoff, and distributed
 tensor-parallel execution as a first-class worker boundary. 
 
-The goal is higher usable throughput and better steady-state `tok/s` for sharded models across multiple workers.
+The goal is higher usable throughput, lower per-worker memory pressure, and
+better steady-state `tok/s` for sharded models across multiple workers.
 
 In the larger Mesh project, `zip` is the worker-side execution runtime beneath the
 control plane, scheduler, and product surfaces.
@@ -21,9 +22,14 @@ control plane, scheduler, and product surfaces.
 - provider-aware execution backends
 - explicit prefill and decode phases
 - microbatch-oriented decode stepping
+- fast-path decode planning with stable bucket/workspace contracts
+- provider-aware decode admission guardrails for batch cohesion
 - checkpoint export/import and KV handoff metadata
 - worker-to-worker networking and tensor-plane transport
-- ring collective execution primitives
+- lane-aware serving transport with stable stream binding
+- ring collective execution primitives, including optimized 2-worker decode
+  all-reduce and direct-byte larger-ring transport paths
+- collective and batching attribution surfaces for production benchmarking
 - device capability, connectivity, and identity helpers
 - model shard metadata and artifact loading
 
@@ -65,8 +71,8 @@ The crate root re-exports the main runtime surfaces:
 
 ## Architecture Summary
 
-`zip` models inference as explicit serving sessions instead of opaque one-shot
-worker jobs.
+`zip` models inference as explicit serving sessions with persistent runtime
+state across prefill, decode, handoff, and recovery boundaries.
 
 Each active session owns:
 
@@ -78,7 +84,25 @@ Each active session owns:
 
 The runtime executes prefill and decode as separate phases. Prefill can emit a
 checkpoint-backed handoff boundary. Decode work is admitted through an explicit
-runtime queue and advanced with batch-oriented stepping.
+runtime queue and advanced with batch-oriented stepping. Accelerated decode is
+planned against explicit backend contracts, bucket ceilings, workspace limits,
+and live-KV invariants.
+
+## Runtime Highlights
+
+- explicit session lifecycle with checkpoint-backed handoff and resume
+- decode microbatch formation with fairness, KV-budget, and fast-path cohesion
+  guardrails
+- stable serving lanes for reduce-scatter, all-gather, control, bulk, and
+  checkpoint traffic
+- logical collective stream IDs bound to durable underlying peer channels
+- direct-byte collective transport for matrix and tensor all-reduce
+- sender-position-aware slot mailboxes for overlapped larger-ring receive paths
+- provider-specialized execution paths across CPU, Metal, and CUDA-capable
+  deployments
+- pooled Metal collective scratch for lower allocation churn during decode
+- runtime telemetry for collective wait share, transport cost, batch deferrals,
+  and recovery behavior
 
 See [ARCHITECTURE.md](/Users/deepsaint/Desktop/zip/ARCHITECTURE.md) for the
 detailed design.
@@ -86,6 +110,7 @@ detailed design.
 ## Build
 
 ```bash
+cargo fmt --check
 cargo check
 cargo test
 ```
