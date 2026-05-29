@@ -565,9 +565,10 @@ fn deterministic_sample_threshold(rng_seed: u64) -> f32 {
     ((rng_state >> 33) as f32) / (u32::MAX as f32)
 }
 
-fn deterministic_sample_thresholds(rng_seed: u64, batch_size: usize) -> Vec<f32> {
-    (0..batch_size)
-        .map(|idx| deterministic_sample_threshold(rng_seed.wrapping_add(idx as u64)))
+fn deterministic_sample_thresholds_for_seeds(rng_seeds: &[u64]) -> Vec<f32> {
+    rng_seeds
+        .iter()
+        .map(|seed| deterministic_sample_threshold(*seed))
         .collect()
 }
 
@@ -594,11 +595,11 @@ fn apply_top_p_device(sorted_probs: &CandleTensor, top_p: f32) -> Result<CandleT
         .map_err(candle_error)
 }
 
-pub(crate) fn sample_tokens_device(
+pub(crate) fn sample_tokens_device_with_seeds(
     logits: &CandleTensor,
     temperature: f32,
     top_p: f32,
-    rng_seed: u64,
+    rng_seeds: &[u64],
 ) -> Result<Vec<u32>> {
     let dims = logits.dims();
     if dims.len() != 2 {
@@ -611,6 +612,13 @@ pub(crate) fn sample_tokens_device(
         return Err(AgentError::Execution(
             "Device sampling received an empty logits tensor".to_string(),
         ));
+    }
+    if dims[0] != rng_seeds.len() {
+        return Err(AgentError::Execution(format!(
+            "Device sampling received {} rows but {} seeds",
+            dims[0],
+            rng_seeds.len()
+        )));
     }
 
     if temperature <= 0.0 || top_p <= 0.0 {
@@ -641,7 +649,7 @@ pub(crate) fn sample_tokens_device(
         .broadcast_mul(&denom.recip().map_err(candle_error)?)
         .map_err(candle_error)?;
     let cdf = renormalized.cumsum(D::Minus1).map_err(candle_error)?;
-    let thresholds = deterministic_sample_thresholds(rng_seed, dims[0]);
+    let thresholds = deterministic_sample_thresholds_for_seeds(rng_seeds);
     let threshold = CandleTensor::from_vec(thresholds, (dims[0], 1), &device)
         .map_err(candle_error)?
         .broadcast_as((dims[0], dims[1]))
@@ -658,6 +666,25 @@ pub(crate) fn sample_tokens_device(
         .and_then(|ids| ids.to_vec1::<u32>())
         .map_err(candle_error)?;
     Ok(sampled_token_ids)
+}
+
+pub(crate) fn sample_tokens_device(
+    logits: &CandleTensor,
+    temperature: f32,
+    top_p: f32,
+    rng_seed: u64,
+) -> Result<Vec<u32>> {
+    let dims = logits.dims();
+    if dims.len() != 2 {
+        return Err(AgentError::Execution(format!(
+            "Device sampling expects rank-2 logits, got {:?}",
+            dims
+        )));
+    }
+    let seeds = (0..dims[0])
+        .map(|idx| rng_seed.wrapping_add(idx as u64))
+        .collect::<Vec<_>>();
+    sample_tokens_device_with_seeds(logits, temperature, top_p, &seeds)
 }
 
 pub(crate) fn sample_token_device(
@@ -895,8 +922,53 @@ pub(crate) fn from_candle_2d(tensor: &CandleTensor) -> Result<Tensor2D> {
     Tensor2D::new(data, dims[0], dims[1])
 }
 
+#[cfg(test)]
 pub(crate) fn collective_buffer_from_candle_2d(
     tensor: &CandleTensor,
+) -> Result<crate::executor::ring_allreduce::CollectiveMatrix> {
+    collective_buffer_from_candle_2d_with_scratch(tensor, None)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Default)]
+struct ReusableMetalCollectiveScratchSlot {
+    storage: Option<MetalStorage>,
+    capacity_elements: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct ReusableMetalCollectiveScratchPool {
+    slots: [ReusableMetalCollectiveScratchSlot; 2],
+    next_slot: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Default for ReusableMetalCollectiveScratchPool {
+    fn default() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| ReusableMetalCollectiveScratchSlot::default()),
+            next_slot: 0,
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl ReusableMetalCollectiveScratchPool {
+    pub(crate) fn clear(&mut self) {
+        for slot in &mut self.slots {
+            slot.storage = None;
+            slot.capacity_elements = 0;
+        }
+        self.next_slot = 0;
+    }
+}
+
+pub(crate) fn collective_buffer_from_candle_2d_with_scratch(
+    tensor: &CandleTensor,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))] scratch: Option<
+        &mut ReusableMetalCollectiveScratchPool,
+    >,
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))] _scratch: Option<&mut ()>,
 ) -> Result<crate::executor::ring_allreduce::CollectiveMatrix> {
     let dims = tensor.dims();
     if dims.len() != 2 {
@@ -906,37 +978,50 @@ pub(crate) fn collective_buffer_from_candle_2d(
         )));
     }
 
-    let flattened = tensor
-        .flatten_all()
-        .map_err(candle_error)?
-        .to_dtype(DType::F32)
-        .map_err(candle_error)?
-        .contiguous()
-        .map_err(candle_error)?;
-
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        let (storage, layout) = flattened.storage_and_layout();
+        let (storage, layout) = tensor.storage_and_layout();
         if let Storage::Metal(storage) = &*storage {
-            if layout.is_contiguous() {
+            if tensor.dtype() == DType::F32 && layout.is_contiguous() {
                 let device = storage.device().clone();
                 let element_count = dims[0] * dims[1];
-                let shared_buffer = device
-                    .allocate_buffer(element_count * std::mem::size_of::<f32>())
-                    .map_err(candle_error)?;
+                let shared_storage = if let Some(scratch) = scratch {
+                    let slot_idx = scratch.next_slot % scratch.slots.len();
+                    scratch.next_slot = (scratch.next_slot + 1) % scratch.slots.len();
+                    let slot = &mut scratch.slots[slot_idx];
+                    if slot.capacity_elements < element_count || slot.storage.is_none() {
+                        let shared_buffer = device
+                            .allocate_buffer(element_count * std::mem::size_of::<f32>())
+                            .map_err(candle_error)?;
+                        slot.storage = Some(MetalStorage::new(
+                            shared_buffer,
+                            device.clone(),
+                            element_count,
+                            DType::F32,
+                        ));
+                        slot.capacity_elements = element_count;
+                    }
+                    slot.storage
+                        .as_ref()
+                        .expect("metal collective scratch must be initialized")
+                        .clone()
+                } else {
+                    let shared_buffer = device
+                        .allocate_buffer(element_count * std::mem::size_of::<f32>())
+                        .map_err(candle_error)?;
+                    MetalStorage::new(shared_buffer, device.clone(), element_count, DType::F32)
+                };
                 {
                     let blit = device.blit_command_encoder().map_err(candle_error)?;
                     blit.copy_from_buffer(
                         storage.buffer(),
                         layout.start_offset() * std::mem::size_of::<f32>(),
-                        &shared_buffer,
+                        shared_storage.buffer(),
                         0,
                         element_count * std::mem::size_of::<f32>(),
                     );
                 }
                 device.wait_until_completed().map_err(candle_error)?;
-                let shared_storage =
-                    MetalStorage::new(shared_buffer, device, element_count, DType::F32);
                 return Ok(
                     crate::executor::ring_allreduce::CollectiveMatrix::from_shared_metal(
                         shared_storage,
@@ -948,12 +1033,21 @@ pub(crate) fn collective_buffer_from_candle_2d(
         }
     }
 
+    let flattened = tensor
+        .flatten_all()
+        .map_err(candle_error)?
+        .to_dtype(DType::F32)
+        .map_err(candle_error)?
+        .contiguous()
+        .map_err(candle_error)?;
+
     let data = flattened.to_vec1::<f32>().map_err(candle_error)?;
     Ok(crate::executor::ring_allreduce::CollectiveMatrix::new(
         data, dims[0], dims[1],
     ))
 }
 
+#[cfg(test)]
 pub(crate) fn candle_2d_from_collective_buffer(
     tensor: &crate::executor::ring_allreduce::CollectiveMatrix,
 ) -> Result<CandleTensor> {
@@ -969,18 +1063,16 @@ pub(crate) fn candle_2d_from_collective_buffer_owned_like(
     tensor: crate::executor::ring_allreduce::CollectiveMatrix,
     template: &CandleTensor,
 ) -> Result<CandleTensor> {
+    let rows = tensor.rows;
+    let cols = tensor.cols;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if let Some(storage) = tensor.metal_shared_storage() {
-        return restore_shared_metal_collective(storage, tensor.rows, tensor.cols, template)
+        return restore_shared_metal_collective(storage, rows, cols, template)
             .map_err(candle_error);
     }
 
-    CandleTensor::from_vec(
-        tensor.to_host_vec(),
-        (tensor.rows, tensor.cols),
-        template.device(),
-    )
-    .map_err(candle_error)
+    CandleTensor::from_vec(tensor.into_host_vec(), (rows, cols), template.device())
+        .map_err(candle_error)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

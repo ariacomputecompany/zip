@@ -54,9 +54,11 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::kv_cache::{KVCache, KVCacheConfig, KVCacheSnapshot};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use super::tensor_ops::ReusableMetalCollectiveScratchPool;
 use super::tensor_ops::{
     apply_rope, apply_rope_candle, candle_2d_from_collective_buffer_owned_like,
-    collective_buffer_from_candle_2d, embed_tokens, from_candle_2d, matmul, rms_norm,
+    collective_buffer_from_candle_2d_with_scratch, embed_tokens, from_candle_2d, matmul, rms_norm,
     rms_norm_candle, sample_greedy, sample_token, sample_token_device, silu, silu_candle,
     to_candle_1d, to_candle_2d, Tensor1D, Tensor2D,
 };
@@ -407,6 +409,7 @@ impl DeviceLayerKVCache {
         Ok((active_keys, active_values, self.seq_len))
     }
 
+    #[cfg(test)]
     fn block_table_len(&self) -> usize {
         self.block_table.len()
     }
@@ -554,10 +557,12 @@ impl DeviceKVCache {
         Ok(())
     }
 
+    #[cfg(test)]
     fn live_page_tokens(&self) -> usize {
         self.config.live_page_tokens()
     }
 
+    #[cfg(test)]
     fn live_block_table_len(&self, layer_idx: usize) -> Result<usize> {
         self.layers
             .get(layer_idx)
@@ -878,12 +883,14 @@ fn attention_output(
 /// Forward pass state for tensor-parallel inference
 #[derive(Clone)]
 struct DeviceLayerWeights {
-    w_q: CandleTensor,
-    w_k: CandleTensor,
-    w_v: CandleTensor,
+    q_width: usize,
+    k_width: usize,
+    v_width: usize,
+    w_qkv: CandleTensor,
     w_o: CandleTensor,
-    w_up: CandleTensor,
-    w_gate: CandleTensor,
+    gate_width: usize,
+    up_width: usize,
+    w_gate_up: CandleTensor,
     w_down: CandleTensor,
     attn_norm: CandleTensor,
     mlp_norm: CandleTensor,
@@ -908,12 +915,9 @@ fn candle_tensor_memory_usage_bytes(tensor: &CandleTensor) -> usize {
 
 impl DeviceLayerWeights {
     fn memory_usage_bytes(&self) -> usize {
-        candle_tensor_memory_usage_bytes(&self.w_q)
-            .saturating_add(candle_tensor_memory_usage_bytes(&self.w_k))
-            .saturating_add(candle_tensor_memory_usage_bytes(&self.w_v))
+        candle_tensor_memory_usage_bytes(&self.w_qkv)
             .saturating_add(candle_tensor_memory_usage_bytes(&self.w_o))
-            .saturating_add(candle_tensor_memory_usage_bytes(&self.w_up))
-            .saturating_add(candle_tensor_memory_usage_bytes(&self.w_gate))
+            .saturating_add(candle_tensor_memory_usage_bytes(&self.w_gate_up))
             .saturating_add(candle_tensor_memory_usage_bytes(&self.w_down))
             .saturating_add(candle_tensor_memory_usage_bytes(&self.attn_norm))
             .saturating_add(candle_tensor_memory_usage_bytes(&self.mlp_norm))
@@ -927,13 +931,20 @@ impl DeviceModelWeights {
         let lm_head = to_candle_2d(&weights.lm_head)?;
         let mut layers = Vec::with_capacity(weights.layers.len());
         for layer in &weights.layers {
+            let w_q = to_candle_2d(&layer.w_q)?;
+            let w_k = to_candle_2d(&layer.w_k)?;
+            let w_v = to_candle_2d(&layer.w_v)?;
+            let w_up = to_candle_2d(&layer.w_up)?;
+            let w_gate = to_candle_2d(&layer.w_gate)?;
             layers.push(DeviceLayerWeights {
-                w_q: to_candle_2d(&layer.w_q)?,
-                w_k: to_candle_2d(&layer.w_k)?,
-                w_v: to_candle_2d(&layer.w_v)?,
+                q_width: layer.w_q.cols,
+                k_width: layer.w_k.cols,
+                v_width: layer.w_v.cols,
+                w_qkv: concat_projection_tensors(&[&w_q, &w_k, &w_v])?,
+                gate_width: layer.w_gate.cols,
+                up_width: layer.w_up.cols,
+                w_gate_up: concat_projection_tensors(&[&w_gate, &w_up])?,
                 w_o: to_candle_2d(&layer.w_o)?,
-                w_up: to_candle_2d(&layer.w_up)?,
-                w_gate: to_candle_2d(&layer.w_gate)?,
                 w_down: to_candle_2d(&layer.w_down)?,
                 attn_norm: to_candle_1d(&layer.attn_norm)?,
                 mlp_norm: to_candle_1d(&layer.mlp_norm)?,
@@ -958,6 +969,98 @@ impl DeviceModelWeights {
             .saturating_add(candle_tensor_memory_usage_bytes(&self.final_norm))
             .saturating_add(candle_tensor_memory_usage_bytes(&self.lm_head))
     }
+}
+
+fn concat_projection_tensors(tensors: &[&CandleTensor]) -> Result<CandleTensor> {
+    let first = tensors.first().ok_or_else(|| {
+        AgentError::Execution("cannot concatenate an empty projection set".to_string())
+    })?;
+    let dims = first.dims();
+    if dims.len() != 2 {
+        return Err(AgentError::Execution(format!(
+            "projection concatenation expects rank-2 tensors, got {:?}",
+            dims
+        )));
+    }
+    let rows = dims[0];
+    for tensor in tensors {
+        let tensor_dims = tensor.dims();
+        if tensor_dims.len() != 2 || tensor_dims[0] != rows {
+            return Err(AgentError::Execution(format!(
+                "projection concatenation shape mismatch: expected [{} x _], got {:?}",
+                rows, tensor_dims
+            )));
+        }
+    }
+
+    CandleTensor::cat(tensors, 1).map_err(|e| {
+        AgentError::Execution(format!(
+            "GPU tensor backend error while concatenating projections: {}",
+            e
+        ))
+    })
+}
+
+fn split_projection_tensor(tensor: &CandleTensor, widths: &[usize]) -> Result<Vec<CandleTensor>> {
+    let dims = tensor.dims();
+    if dims.len() != 2 {
+        return Err(AgentError::Execution(format!(
+            "projection split expects rank-2 tensor, got {:?}",
+            dims
+        )));
+    }
+    let total_width: usize = widths.iter().sum();
+    if dims[1] != total_width {
+        return Err(AgentError::Execution(format!(
+            "projection split width mismatch: tensor cols {} vs expected {}",
+            dims[1], total_width
+        )));
+    }
+
+    let mut outputs = Vec::with_capacity(widths.len());
+    let mut start = 0usize;
+    for width in widths {
+        outputs.push(
+            tensor
+                .narrow(1, start, *width)
+                .map_err(|e| AgentError::Execution(format!("GPU tensor backend error: {}", e)))?,
+        );
+        start = start.saturating_add(*width);
+    }
+    Ok(outputs)
+}
+
+fn qkv_partials_from_combined(
+    normed: &CandleTensor,
+    layer: &DeviceLayerWeights,
+) -> Result<(CandleTensor, CandleTensor, CandleTensor)> {
+    let combined = normed
+        .matmul(&layer.w_qkv)
+        .map_err(|e| AgentError::Execution(format!("GPU tensor backend error: {}", e)))?;
+    let widths = [layer.q_width, layer.k_width, layer.v_width];
+    let parts = split_projection_tensor(&combined, &widths)?;
+    let mut iter = parts.into_iter();
+    Ok((
+        iter.next().expect("q projection"),
+        iter.next().expect("k projection"),
+        iter.next().expect("v projection"),
+    ))
+}
+
+fn gate_up_partials_from_combined(
+    mlp_normed: &CandleTensor,
+    layer: &DeviceLayerWeights,
+) -> Result<(CandleTensor, CandleTensor)> {
+    let combined = mlp_normed
+        .matmul(&layer.w_gate_up)
+        .map_err(|e| AgentError::Execution(format!("GPU tensor backend error: {}", e)))?;
+    let widths = [layer.gate_width, layer.up_width];
+    let parts = split_projection_tensor(&combined, &widths)?;
+    let mut iter = parts.into_iter();
+    Ok((
+        iter.next().expect("gate projection"),
+        iter.next().expect("up projection"),
+    ))
 }
 
 #[derive(Clone)]
@@ -999,6 +1102,9 @@ pub struct ForwardPass {
     device_weights: Arc<DeviceModelWeights>,
     config: ModelConfig,
     allreduce_timeout: std::time::Duration,
+    local_kv_head_indices: CandleTensor,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    collective_scratch: ReusableMetalCollectiveScratchPool,
 
     /// KV cache for attention
     device_kv_cache: DeviceKVCache,
@@ -1036,11 +1142,31 @@ impl ForwardPass {
             head_dim: config.hidden_dim / config.num_heads,
             max_seq_len: 4096,
         };
+        let head_dim = config.hidden_dim / config.num_heads;
+        let local_q_heads =
+            partition_columns(config.hidden_dim, worker_position, total_workers) / head_dim;
+        let q_head_start =
+            partition_start(config.hidden_dim, worker_position, total_workers) / head_dim;
+        let local_kv_head_indices = CandleTensor::from_vec(
+            build_local_kv_head_indices(
+                &config,
+                worker_position,
+                total_workers,
+                local_q_heads,
+                q_head_start,
+            )?,
+            local_q_heads,
+            residency.device_weights.embedding.device(),
+        )
+        .map_err(device_error)?;
 
         Ok(Self {
             device_weights: Arc::clone(&residency.device_weights),
             config,
             allreduce_timeout,
+            local_kv_head_indices,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            collective_scratch: ReusableMetalCollectiveScratchPool::default(),
             device_kv_cache: DeviceKVCache::new(kv_config),
             shard_start,
             shard_end,
@@ -1109,15 +1235,7 @@ impl ForwardPass {
         let normed = rms_norm_candle(hidden, &layer.attn_norm, config.rms_norm_eps)?;
 
         // 2. Compute partial QKV projections (my columns only)
-        let q_partial = normed.matmul(&layer.w_q).map_err(|e| {
-            crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
-        })?;
-        let k_partial = normed.matmul(&layer.w_k).map_err(|e| {
-            crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
-        })?;
-        let v_partial = normed.matmul(&layer.w_v).map_err(|e| {
-            crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
-        })?;
+        let (q_partial, k_partial, v_partial) = qkv_partials_from_combined(&normed, &layer)?;
 
         debug!(
             "Layer {} QKV partial computed: {}x{} -> {}x{}",
@@ -1136,6 +1254,7 @@ impl ForwardPass {
             self.total_workers,
             layer_idx,
             absolute_positions,
+            &self.local_kv_head_indices,
             q_partial,
             k_partial,
             v_partial,
@@ -1153,17 +1272,13 @@ impl ForwardPass {
         let post_attn = hidden.broadcast_add(&o_full).map_err(|e| {
             crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
         })?;
+        drop(o_full);
 
         // 8. MLP with SwiGLU
         let mlp_normed = rms_norm_candle(&post_attn, &layer.mlp_norm, config.rms_norm_eps)?;
 
         // Gate and up projections are column-parallel and stay local
-        let gate_partial = mlp_normed.matmul(&layer.w_gate).map_err(|e| {
-            crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
-        })?;
-        let up_partial = mlp_normed.matmul(&layer.w_up).map_err(|e| {
-            crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
-        })?;
+        let (gate_partial, up_partial) = gate_up_partials_from_combined(&mlp_normed, &layer)?;
 
         // SwiGLU: silu(gate) * up
         let gate_activated = silu_candle(&gate_partial)?;
@@ -1183,6 +1298,7 @@ impl ForwardPass {
         let output = post_attn.broadcast_add(&down_full).map_err(|e| {
             crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
         })?;
+        drop(down_full);
 
         debug!(
             "Layer {} forward complete in {:?}",
@@ -1332,9 +1448,11 @@ impl ForwardPass {
         tokens: &[u32],
         job_ids: &[Uuid],
         worker_ring: &mut WorkerRing<'_>,
-    ) -> Result<Vec<BackendLogits>> {
+    ) -> Result<CandleTensor> {
         if backends.is_empty() || tokens.is_empty() {
-            return Ok(Vec::new());
+            return Err(crate::errors::AgentError::Execution(
+                "Decode microbatch requires at least one backend and token".to_string(),
+            ));
         }
         if backends.len() != tokens.len() || backends.len() != job_ids.len() {
             return Err(crate::errors::AgentError::Execution(format!(
@@ -1345,17 +1463,27 @@ impl ForwardPass {
             )));
         }
 
-        let (config, device_weights, worker_position, total_workers, allreduce_timeout) = {
+        let (
+            config,
+            device_weights,
+            local_kv_head_indices,
+            worker_position,
+            total_workers,
+            allreduce_timeout,
+        ) = {
             let template = &backends[0].forward_pass;
             (
                 template.config.clone(),
                 template.device_weights.clone(),
+                template.local_kv_head_indices.clone(),
                 template.worker_position,
                 template.total_workers,
                 template.allreduce_timeout,
             )
         };
-        let batch_job_id = job_ids[0];
+        let batch_job_id = collective_batch_job_id(job_ids);
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let mut batch_collective_scratch = ReusableMetalCollectiveScratchPool::default();
 
         let mut positions = Vec::with_capacity(backends.len());
         for backend in backends.iter() {
@@ -1389,29 +1517,18 @@ impl ForwardPass {
         let mut metrics = RingAllReduceMetrics::default();
 
         for layer_idx in 0..config.num_layers {
-            let layer = device_weights.layers[layer_idx].clone();
+            let layer = &device_weights.layers[layer_idx];
             let normed = rms_norm_candle(&hidden, &layer.attn_norm, config.rms_norm_eps)?;
-            let q_partial = normed.matmul(&layer.w_q).map_err(|e| {
-                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
-            })?;
-            let k_partial = normed.matmul(&layer.w_k).map_err(|e| {
-                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
-            })?;
-            let v_partial = normed.matmul(&layer.w_v).map_err(|e| {
-                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
-            })?;
+            let (q_partial, k_partial, v_partial) = qkv_partials_from_combined(&normed, &layer)?;
 
-            let mut kv_caches = backends
-                .iter_mut()
-                .map(|backend| &mut backend.forward_pass.device_kv_cache)
-                .collect::<Vec<_>>();
-            let attn_output = attention_output_device_batch(
-                &mut kv_caches,
+            let attn_output = attention_output_device_batch_from_backends(
+                backends,
                 &config,
                 worker_position,
                 total_workers,
                 layer_idx,
                 &positions,
+                &local_kv_head_indices,
                 q_partial,
                 k_partial,
                 v_partial,
@@ -1422,6 +1539,10 @@ impl ForwardPass {
             })?;
             let o_full = Self::ring_allreduce_candle_batch(
                 &o_partial,
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                Some(&mut batch_collective_scratch),
+                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+                None,
                 worker_ring,
                 batch_job_id,
                 layer_idx as u32,
@@ -1432,14 +1553,10 @@ impl ForwardPass {
             let post_attn = hidden.broadcast_add(&o_full).map_err(|e| {
                 crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
             })?;
+            drop(o_full);
 
             let mlp_normed = rms_norm_candle(&post_attn, &layer.mlp_norm, config.rms_norm_eps)?;
-            let gate_partial = mlp_normed.matmul(&layer.w_gate).map_err(|e| {
-                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
-            })?;
-            let up_partial = mlp_normed.matmul(&layer.w_up).map_err(|e| {
-                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
-            })?;
+            let (gate_partial, up_partial) = gate_up_partials_from_combined(&mlp_normed, &layer)?;
             let gate_activated = silu_candle(&gate_partial)?;
             let mlp_hidden = gate_activated.broadcast_mul(&up_partial).map_err(|e| {
                 crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
@@ -1449,6 +1566,10 @@ impl ForwardPass {
             })?;
             let down_full = Self::ring_allreduce_candle_batch(
                 &down_partial,
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                Some(&mut batch_collective_scratch),
+                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+                None,
                 worker_ring,
                 batch_job_id,
                 layer_idx as u32,
@@ -1459,25 +1580,18 @@ impl ForwardPass {
             hidden = post_attn.broadcast_add(&down_full).map_err(|e| {
                 crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
             })?;
+            drop(down_full);
         }
 
         hidden = rms_norm_candle(&hidden, &device_weights.final_norm, config.rms_norm_eps)?;
         let logits_2d = hidden.matmul(&device_weights.lm_head).map_err(|e| {
             crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
         })?;
-        let dims = logits_2d.dims();
-        let mut logits = Vec::with_capacity(dims[0]);
-        for row_idx in 0..dims[0] {
-            let row = logits_2d.narrow(0, row_idx, 1).map_err(|e| {
-                crate::errors::AgentError::Execution(format!("GPU tensor backend error: {}", e))
-            })?;
-            logits.push(BackendLogits::Device(row));
-        }
         for backend in backends.iter_mut() {
             backend.forward_pass.position += 1;
             backend.forward_pass.last_allreduce_metrics = metrics;
         }
-        Ok(logits)
+        Ok(logits_2d)
     }
 
     /// Materialize a single collective buffer from a device tensor and restore
@@ -1492,7 +1606,13 @@ impl ForwardPass {
         if worker_ring.total_workers <= 1 {
             return Ok(tensor.clone());
         }
-        let flat = collective_buffer_from_candle_2d(tensor)?;
+        let flat = collective_buffer_from_candle_2d_with_scratch(
+            tensor,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            Some(&mut self.collective_scratch),
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            None,
+        )?;
         let reduced = worker_ring
             .ring_all_reduce_matrix_with_timeout(flat, job_id, layer_idx, self.allreduce_timeout)
             .await?;
@@ -1503,6 +1623,10 @@ impl ForwardPass {
 
     async fn ring_allreduce_candle_batch(
         tensor: &CandleTensor,
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))] scratch: Option<
+            &mut ReusableMetalCollectiveScratchPool,
+        >,
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))] scratch: Option<&mut ()>,
         worker_ring: &mut WorkerRing<'_>,
         job_id: Uuid,
         layer_idx: u32,
@@ -1512,7 +1636,7 @@ impl ForwardPass {
         if worker_ring.total_workers <= 1 {
             return Ok(tensor.clone());
         }
-        let flat = collective_buffer_from_candle_2d(tensor)?;
+        let flat = collective_buffer_from_candle_2d_with_scratch(tensor, scratch)?;
         let reduced = worker_ring
             .ring_all_reduce_matrix_with_timeout(flat, job_id, layer_idx, allreduce_timeout)
             .await?;
@@ -1524,6 +1648,8 @@ impl ForwardPass {
     pub fn clear_cache(&mut self) {
         self.device_kv_cache.clear();
         self.position = 0;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        self.collective_scratch.clear();
     }
 
     /// Get current KV cache memory usage
@@ -1620,6 +1746,7 @@ fn attention_output_device(
     total_workers: u32,
     layer_idx: usize,
     absolute_positions: &[u32],
+    local_kv_head_indices: &CandleTensor,
     q_local: CandleTensor,
     k_local: CandleTensor,
     v_local: CandleTensor,
@@ -1704,29 +1831,35 @@ fn attention_output_device(
         total_workers,
         layer_idx,
         cache_prefix_len,
+        local_kv_head_indices,
         &q_rope,
     )
 }
 
-fn attention_output_device_batch(
-    kv_caches: &mut [&mut DeviceKVCache],
+fn attention_output_device_batch_from_backends(
+    backends: &mut [&mut crate::inference::backend::CandleExecutionBackend],
     config: &ModelConfig,
     worker_position: u32,
     total_workers: u32,
     layer_idx: usize,
     absolute_positions: &[u32],
+    local_kv_head_indices: &CandleTensor,
     q_local: CandleTensor,
     k_local: CandleTensor,
     v_local: CandleTensor,
 ) -> Result<CandleTensor> {
-    let batch_size = q_local.dims()[0];
-    if kv_caches.len() != batch_size || absolute_positions.len() != batch_size {
-        return Err(crate::errors::AgentError::Execution(format!(
-            "Batched attention state mismatch: caches={} positions={} batch={}",
-            kv_caches.len(),
+    let batch_size = backends.len();
+    if absolute_positions.len() != batch_size {
+        return Err(AgentError::Execution(format!(
+            "Device batch attention position count {} does not match backend batch size {}",
             absolute_positions.len(),
             batch_size
         )));
+    }
+    if batch_size == 0 {
+        return Err(AgentError::Execution(
+            "Device batch attention requires at least one backend".to_string(),
+        ));
     }
     if config.num_heads == 0 || config.hidden_dim % config.num_heads != 0 {
         return Err(crate::errors::AgentError::Execution(format!(
@@ -1795,31 +1928,31 @@ fn attention_output_device_batch(
     )?;
 
     let mut outputs = Vec::with_capacity(batch_size);
-    for row_idx in 0..batch_size {
-        let current_layer_seq_len = kv_caches[row_idx].layer_seq_len(layer_idx)?;
-        let max_seq_len = kv_caches[row_idx].config.max_seq_len.max(1);
+    for (row_idx, backend) in backends.iter_mut().enumerate() {
+        let kv_cache = &mut backend.forward_pass.device_kv_cache;
+        let current_layer_seq_len = kv_cache.layer_seq_len(layer_idx)?;
+        let max_seq_len = kv_cache.config.max_seq_len.max(1);
         if current_layer_seq_len.saturating_add(1) > max_seq_len {
             let drop_rows = current_layer_seq_len.saturating_add(1) - max_seq_len;
-            kv_caches[row_idx].retain_suffix(current_layer_seq_len.saturating_sub(drop_rows))?;
+            kv_cache.retain_suffix(current_layer_seq_len.saturating_sub(drop_rows))?;
         }
-        let prefix_len = kv_caches[row_idx].layer_seq_len(layer_idx)?;
+        let prefix_len = kv_cache.layer_seq_len(layer_idx)?;
         validate_positions(
             &[absolute_positions[row_idx]],
-            kv_caches[row_idx]
-                .base_position()
-                .saturating_add(prefix_len),
+            kv_cache.base_position().saturating_add(prefix_len),
         )?;
         let q_row = q_rope.narrow(0, row_idx, 1).map_err(device_error)?;
         let k_row = k_rope.narrow(0, row_idx, 1).map_err(device_error)?;
         let v_row = v_local.narrow(0, row_idx, 1).map_err(device_error)?;
-        kv_caches[row_idx].append_layer(layer_idx, &k_row, &v_row)?;
+        kv_cache.append_layer(layer_idx, &k_row, &v_row)?;
         outputs.push(attention_output_device_cached(
-            kv_caches[row_idx],
+            kv_cache,
             config,
             worker_position,
             total_workers,
             layer_idx,
             prefix_len,
+            local_kv_head_indices,
             &q_row,
         )?);
     }
@@ -1831,10 +1964,11 @@ fn attention_output_device_batch(
 fn attention_output_device_cached(
     kv_cache: &DeviceKVCache,
     config: &ModelConfig,
-    worker_position: u32,
-    total_workers: u32,
+    _worker_position: u32,
+    _total_workers: u32,
     layer_idx: usize,
     cache_prefix_len: usize,
+    local_kv_head_indices: &CandleTensor,
     q_rope: &CandleTensor,
 ) -> Result<CandleTensor> {
     let q_dims = q_rope.dims();
@@ -1848,15 +1982,13 @@ fn attention_output_device_cached(
     let q_cols = q_dims[1];
     let head_dim = config.hidden_dim / config.num_heads;
     let local_q_heads = q_cols / head_dim;
-    let q_head_start =
-        partition_start(config.hidden_dim, worker_position, total_workers) / head_dim;
-    let local_kv_indices = build_local_kv_head_indices(
-        config,
-        worker_position,
-        total_workers,
-        local_q_heads,
-        q_head_start,
-    )?;
+    if local_kv_head_indices.dims() != [local_q_heads] {
+        return Err(AgentError::Execution(format!(
+            "Local KV head index tensor mismatch: expected [{}], got {:?}",
+            local_q_heads,
+            local_kv_head_indices.dims()
+        )));
+    }
 
     let (cached_k, cached_v, cached_seq_len) = kv_cache.get_layer_active_kv(layer_idx)?;
     let k_dims = cached_k.dims();
@@ -1890,15 +2022,13 @@ fn attention_output_device_cached(
         .contiguous()
         .map_err(device_error)?;
 
-    let kv_indices = CandleTensor::from_vec(local_kv_indices, local_q_heads, q_rope.device())
-        .map_err(device_error)?;
     let selected_k = k_heads
-        .index_select(&kv_indices, 0)
+        .index_select(local_kv_head_indices, 0)
         .map_err(device_error)?
         .contiguous()
         .map_err(device_error)?;
     let selected_v = v_heads
-        .index_select(&kv_indices, 0)
+        .index_select(local_kv_head_indices, 0)
         .map_err(device_error)?
         .contiguous()
         .map_err(device_error)?;
@@ -1907,10 +2037,15 @@ fn attention_output_device_cached(
         .map_err(device_error)?
         .affine(1.0 / (head_dim as f64).sqrt(), 0.0)
         .map_err(device_error)?;
-
-    let mask = causal_attention_mask(q_rows, cached_seq_len, cache_prefix_len, q_rope.device())?;
-    let masked = scores.broadcast_add(&mask).map_err(device_error)?;
-    let probs = candle_nn::ops::softmax(&masked, 2).map_err(device_error)?;
+    let full_prefix_visible = q_rows == 1 && cache_prefix_len + 1 == cached_seq_len;
+    let probs = if full_prefix_visible {
+        candle_nn::ops::softmax(&scores, 2).map_err(device_error)?
+    } else {
+        let mask =
+            causal_attention_mask(q_rows, cached_seq_len, cache_prefix_len, q_rope.device())?;
+        let masked = scores.broadcast_add(&mask).map_err(device_error)?;
+        candle_nn::ops::softmax(&masked, 2).map_err(device_error)?
+    };
     probs
         .matmul(&selected_v)
         .map_err(device_error)?
@@ -1949,6 +2084,16 @@ fn build_local_kv_head_indices(
         indices.push((global_kv_head - kv_head_start) as u32);
     }
     Ok(indices)
+}
+
+fn collective_batch_job_id(job_ids: &[Uuid]) -> Uuid {
+    let mut batch_seed = [0u8; 16];
+    for job_id in job_ids {
+        for (slot, byte) in batch_seed.iter_mut().zip(job_id.as_bytes().iter()) {
+            *slot ^= *byte;
+        }
+    }
+    Uuid::from_bytes(batch_seed)
 }
 
 fn causal_attention_mask(
@@ -2506,6 +2651,7 @@ mod tests {
             InferenceRuntimeMode::ThroughputFirst,
             ExecutionProviderKind::Cpu,
             crate::inference::LocalExecutorContract::for_provider(ExecutionProviderKind::Cpu),
+            None,
             &mut tensor_plane,
         );
 
@@ -2535,7 +2681,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(logits.len(), 2);
+        assert_eq!(logits.dims(), &[2, config.vocab_size]);
         assert_eq!(backend_a.forward_pass.position, 4);
         assert_eq!(backend_b.forward_pass.position, 4);
         assert_eq!(backend_a.forward_pass.device_kv_cache.seq_len(), 2);

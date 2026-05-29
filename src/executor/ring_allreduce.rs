@@ -14,7 +14,7 @@
 use crate::errors::{AgentError, Result};
 use crate::inference::{InferenceRuntimeMode, LocalExecutorContract};
 use crate::network::{
-    CollectiveLane, ServingBackgroundTransfer, ServingFrame, ServingReceiveSpec,
+    CollectiveLane, ServingBackgroundTransfer, ServingFrameBytes, ServingReceiveSpec,
     ServingSessionTransport, TensorPlane,
 };
 use crate::provider::ExecutionProviderKind;
@@ -24,8 +24,8 @@ use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::ops::Range;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::slice;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -36,6 +36,12 @@ pub struct RingAllReduceMetrics {
     pub all_gather_step_time_ms: u64,
     pub send_wait_time_ms: u64,
     pub receive_wait_time_ms: u64,
+    pub collective_operations: u64,
+    pub collective_worker_participants: u64,
+    pub pairwise_fast_path_operations: u64,
+    pub larger_ring_operations: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
 }
 
 impl RingAllReduceMetrics {
@@ -44,6 +50,12 @@ impl RingAllReduceMetrics {
         self.all_gather_step_time_ms += other.all_gather_step_time_ms;
         self.send_wait_time_ms += other.send_wait_time_ms;
         self.receive_wait_time_ms += other.receive_wait_time_ms;
+        self.collective_operations += other.collective_operations;
+        self.collective_worker_participants += other.collective_worker_participants;
+        self.pairwise_fast_path_operations += other.pairwise_fast_path_operations;
+        self.larger_ring_operations += other.larger_ring_operations;
+        self.bytes_sent += other.bytes_sent;
+        self.bytes_received += other.bytes_received;
     }
 }
 
@@ -144,6 +156,18 @@ impl CollectiveMatrix {
         }
     }
 
+    pub fn into_host_vec(self) -> Vec<f32> {
+        let len = self.rows.saturating_mul(self.cols);
+        match self.backing {
+            CollectiveMatrixBacking::Host(data) => data,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            CollectiveMatrixBacking::MetalShared(storage) => {
+                unsafe { slice::from_raw_parts(storage.buffer().contents() as *const f32, len) }
+                    .to_vec()
+            }
+        }
+    }
+
     pub fn host_range(&self, range: Range<usize>) -> &[f32] {
         match &self.backing {
             CollectiveMatrixBacking::Host(data) => &data[range],
@@ -174,6 +198,44 @@ impl CollectiveMatrix {
         }
     }
 
+    pub fn accumulate_range_from_wire_bytes(&mut self, range: Range<usize>, payload_bytes: &[u8]) {
+        let expected_bytes = range.len().saturating_mul(std::mem::size_of::<f32>());
+        assert_eq!(
+            payload_bytes.len(),
+            expected_bytes,
+            "Payload byte length {} did not match matrix range byte length {}",
+            payload_bytes.len(),
+            expected_bytes
+        );
+        match &mut self.backing {
+            CollectiveMatrixBacking::Host(data) => {
+                for (dst, chunk) in data[range]
+                    .iter_mut()
+                    .zip(payload_bytes.chunks_exact(std::mem::size_of::<f32>()))
+                {
+                    *dst += f32::from_bits(u32::from_le_bytes([
+                        chunk[0], chunk[1], chunk[2], chunk[3],
+                    ]));
+                }
+            }
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            CollectiveMatrixBacking::MetalShared(storage) => unsafe {
+                let dst = &mut slice::from_raw_parts_mut(
+                    storage.buffer().contents() as *mut f32,
+                    self.len(),
+                )[range];
+                for (slot, chunk) in dst
+                    .iter_mut()
+                    .zip(payload_bytes.chunks_exact(std::mem::size_of::<f32>()))
+                {
+                    *slot += f32::from_bits(u32::from_le_bytes([
+                        chunk[0], chunk[1], chunk[2], chunk[3],
+                    ]));
+                }
+            },
+        }
+    }
+
     pub fn copy_range_from_slice(&mut self, range: Range<usize>, values: &[f32]) {
         match &mut self.backing {
             CollectiveMatrixBacking::Host(data) => data[range].copy_from_slice(values),
@@ -188,12 +250,76 @@ impl CollectiveMatrix {
         }
     }
 
+    pub fn copy_range_from_wire_bytes(&mut self, range: Range<usize>, payload_bytes: &[u8]) {
+        let expected_bytes = range.len().saturating_mul(std::mem::size_of::<f32>());
+        assert_eq!(
+            payload_bytes.len(),
+            expected_bytes,
+            "Payload byte length {} did not match matrix range byte length {}",
+            payload_bytes.len(),
+            expected_bytes
+        );
+        match &mut self.backing {
+            CollectiveMatrixBacking::Host(data) => {
+                copy_wire_f32_bytes_into_slice(&mut data[range], payload_bytes);
+            }
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            CollectiveMatrixBacking::MetalShared(storage) => unsafe {
+                let dst = &mut slice::from_raw_parts_mut(
+                    storage.buffer().contents() as *mut f32,
+                    self.len(),
+                )[range];
+                copy_wire_f32_bytes_into_slice(dst, payload_bytes);
+            },
+        }
+    }
+
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub fn metal_shared_storage(&self) -> Option<MetalStorage> {
         match &self.backing {
             CollectiveMatrixBacking::MetalShared(storage) => Some(storage.clone()),
             _ => None,
         }
+    }
+}
+
+fn copy_wire_f32_bytes_into_slice(dst: &mut [f32], src: &[u8]) {
+    let expected_bytes = dst.len().saturating_mul(std::mem::size_of::<f32>());
+    assert_eq!(
+        src.len(),
+        expected_bytes,
+        "wire payload byte length {} did not match destination byte length {}",
+        src.len(),
+        expected_bytes
+    );
+    #[cfg(target_endian = "little")]
+    unsafe {
+        let dst_bytes = slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut u8, expected_bytes);
+        dst_bytes.copy_from_slice(src);
+    }
+    #[cfg(target_endian = "big")]
+    for (slot, chunk) in dst
+        .iter_mut()
+        .zip(src.chunks_exact(std::mem::size_of::<f32>()))
+    {
+        *slot = f32::from_bits(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+}
+
+fn accumulate_wire_f32_bytes_into_slice(dst: &mut [f32], src: &[u8]) {
+    let expected_bytes = dst.len().saturating_mul(std::mem::size_of::<f32>());
+    assert_eq!(
+        src.len(),
+        expected_bytes,
+        "wire payload byte length {} did not match destination byte length {}",
+        src.len(),
+        expected_bytes
+    );
+    for (slot, chunk) in dst
+        .iter_mut()
+        .zip(src.chunks_exact(std::mem::size_of::<f32>()))
+    {
+        *slot += f32::from_bits(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
 }
 
@@ -352,6 +478,25 @@ pub struct WorkerRing<'a> {
     background_transfers: Vec<ServingBackgroundTransfer>,
     /// Timings captured during the most recent all-reduce call.
     last_run_metrics: RingAllReduceMetrics,
+    /// Cached chunk layout for repeated collectives of the same flattened size.
+    cached_chunk_layout: Option<Arc<CachedChunkLayout>>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedChunkLayout {
+    len: usize,
+    total_workers: u32,
+    my_position: u32,
+    reduce_scatter_steps: Vec<CachedCollectiveStep>,
+    all_gather_steps: Vec<CachedCollectiveStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedCollectiveStep {
+    send_slot: u32,
+    recv_slot: u32,
+    send_range: Range<usize>,
+    recv_range: Range<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -420,6 +565,7 @@ impl<'a> WorkerRing<'a> {
         runtime_mode: InferenceRuntimeMode,
         provider: ExecutionProviderKind,
         executor_contract: LocalExecutorContract,
+        serving_transport: Option<ServingSessionTransport>,
         tensor_plane: &'a mut TensorPlane,
     ) -> Self {
         let collective_profile =
@@ -432,18 +578,22 @@ impl<'a> WorkerRing<'a> {
             left_tensor_addr,
             right_tensor_addr,
             tensor_plane,
-            serving_transport: None,
+            serving_transport,
             runtime_mode,
             provider,
             executor_contract,
             collective_profile,
             background_transfers: Vec::new(),
             last_run_metrics: RingAllReduceMetrics::default(),
+            cached_chunk_layout: None,
         }
     }
 
     pub async fn prepare_serving_group_channels(&mut self) -> Result<()> {
         if self.total_workers <= 1 {
+            return Ok(());
+        }
+        if self.serving_transport.is_some() {
             return Ok(());
         }
         self.serving_transport = Some(
@@ -479,23 +629,60 @@ impl<'a> WorkerRing<'a> {
         job_id: Uuid,
         layer_idx: u32,
     ) -> Result<Tensor> {
-        self.drain_background_transfers().await?;
+        self.reap_completed_background_transfers().await?;
         if self.total_workers <= 1 {
             self.last_run_metrics = RingAllReduceMetrics::default();
             return Ok(partial_result);
         }
+        if self.total_workers == 2 {
+            let mut run_metrics = RingAllReduceMetrics::default();
+            run_metrics.collective_operations = 1;
+            run_metrics.collective_worker_participants = 2;
+            run_metrics.pairwise_fast_path_operations = 1;
+            let original_shape = partial_result.shape.clone();
+            let mut work_buffer = partial_result.data;
+            let step_started = std::time::Instant::now();
+            let (recv_msg, send_wait_ms, receive_wait_ms) = self
+                .send_chunk_to_right_recv_from_left(
+                    CollectiveLane::ReduceScatter,
+                    job_id,
+                    layer_idx,
+                    0,
+                    0,
+                    0,
+                    &work_buffer,
+                )
+                .await?;
+            run_metrics.reduce_scatter_step_time_ms += step_started.elapsed().as_millis() as u64;
+            run_metrics.send_wait_time_ms += send_wait_ms;
+            run_metrics.receive_wait_time_ms += receive_wait_ms;
+            run_metrics.bytes_sent += (work_buffer.len() * std::mem::size_of::<f32>()) as u64;
+            run_metrics.bytes_received += recv_msg.payload_bytes().len() as u64;
+            if recv_msg.element_count() != work_buffer.len() {
+                return Err(AgentError::Execution(format!(
+                    "Received pairwise all-reduce chunk len {} but expected {}",
+                    recv_msg.element_count(),
+                    work_buffer.len()
+                )));
+            }
+            accumulate_wire_f32_bytes_into_slice(&mut work_buffer, recv_msg.payload_bytes());
+            self.last_run_metrics = run_metrics;
+            return Ok(Tensor::new(work_buffer, original_shape));
+        }
         let n = self.total_workers as usize;
-        let my_pos = self.my_position as usize;
         let original_shape = partial_result.shape.clone();
         let mut run_metrics = RingAllReduceMetrics::default();
-        let chunk_ranges = partial_result.chunk_ranges(n);
+        run_metrics.collective_operations = 1;
+        run_metrics.collective_worker_participants = self.total_workers as u64;
+        run_metrics.larger_ring_operations = 1;
+        let plan = self.cached_collective_plan_for_len(partial_result.data.len());
         let mut work_buffer = partial_result.data;
 
         info!(
             "Starting ring all-reduce: n={}, my_pos={}, chunks={}",
             n,
-            my_pos,
-            chunk_ranges.len()
+            self.my_position,
+            plan.reduce_scatter_steps.len() + 1
         );
 
         // PHASE 1: Reduce-Scatter (n-1 steps)
@@ -504,19 +691,7 @@ impl<'a> WorkerRing<'a> {
             // In step k, worker i:
             // - Sends chunk[(i - k) % n] to right neighbor
             // - Receives from left neighbor into chunk[(i - k - 1) % n]
-            let send_idx = (my_pos + n - step) % n;
-            let recv_idx = (my_pos + n - step - 1) % n;
-
-            debug!(
-                "Reduce-scatter step {}/{}: send_idx={}, recv_idx={}",
-                step + 1,
-                n - 1,
-                send_idx,
-                recv_idx
-            );
-
-            let send_range = &chunk_ranges[send_idx];
-            let send_shape = [send_range.len()];
+            let step_plan = &plan.reduce_scatter_steps[step];
 
             let step_started = std::time::Instant::now();
             let (recv_msg, send_wait_ms, receive_wait_ms) = self
@@ -525,29 +700,29 @@ impl<'a> WorkerRing<'a> {
                     job_id,
                     layer_idx,
                     step as u32,
-                    recv_idx as u32,
-                    &work_buffer[send_range.start..send_range.end],
-                    &send_shape,
+                    step_plan.send_slot,
+                    step_plan.recv_slot,
+                    &work_buffer[step_plan.send_range.start..step_plan.send_range.end],
                 )
                 .await?;
             run_metrics.reduce_scatter_step_time_ms += step_started.elapsed().as_millis() as u64;
             run_metrics.send_wait_time_ms += send_wait_ms;
             run_metrics.receive_wait_time_ms += receive_wait_ms;
+            run_metrics.bytes_sent +=
+                (step_plan.send_range.len() * std::mem::size_of::<f32>()) as u64;
+            run_metrics.bytes_received += recv_msg.payload_bytes().len() as u64;
 
-            let recv_range = &chunk_ranges[recv_idx];
-            if recv_msg.chunk_data.len() != recv_range.len() {
+            if recv_msg.element_count() != step_plan.recv_range.len() {
                 return Err(AgentError::Execution(format!(
                     "Received reduce-scatter chunk len {} but expected {}",
-                    recv_msg.chunk_data.len(),
-                    recv_range.len()
+                    recv_msg.element_count(),
+                    step_plan.recv_range.len()
                 )));
             }
-            for (dst, src) in work_buffer[recv_range.start..recv_range.end]
-                .iter_mut()
-                .zip(recv_msg.chunk_data.iter())
-            {
-                *dst += *src;
-            }
+            accumulate_wire_f32_bytes_into_slice(
+                &mut work_buffer[step_plan.recv_range.start..step_plan.recv_range.end],
+                recv_msg.payload_bytes(),
+            );
         }
 
         info!("Reduce-scatter complete");
@@ -558,19 +733,7 @@ impl<'a> WorkerRing<'a> {
             // In step k, worker i:
             // - Sends the chunk that was accumulated in the previous all-gather step
             // - Or in step 0, sends the chunk accumulated in reduce-scatter
-            let send_idx = (my_pos + n - step + 1) % n;
-            let recv_idx = (my_pos + n - step) % n;
-
-            debug!(
-                "All-gather step {}/{}: send_idx={}, recv_idx={}",
-                step + 1,
-                n - 1,
-                send_idx,
-                recv_idx
-            );
-
-            let send_range = &chunk_ranges[send_idx];
-            let send_shape = [send_range.len()];
+            let step_plan = &plan.all_gather_steps[step];
 
             let step_started = std::time::Instant::now();
             let (recv_msg, send_wait_ms, receive_wait_ms) = self
@@ -579,24 +742,29 @@ impl<'a> WorkerRing<'a> {
                     job_id,
                     layer_idx,
                     step as u32,
-                    recv_idx as u32,
-                    &work_buffer[send_range.start..send_range.end],
-                    &send_shape,
+                    step_plan.send_slot,
+                    step_plan.recv_slot,
+                    &work_buffer[step_plan.send_range.start..step_plan.send_range.end],
                 )
                 .await?;
             run_metrics.all_gather_step_time_ms += step_started.elapsed().as_millis() as u64;
             run_metrics.send_wait_time_ms += send_wait_ms;
             run_metrics.receive_wait_time_ms += receive_wait_ms;
+            run_metrics.bytes_sent +=
+                (step_plan.send_range.len() * std::mem::size_of::<f32>()) as u64;
+            run_metrics.bytes_received += recv_msg.payload_bytes().len() as u64;
 
-            let recv_range = &chunk_ranges[recv_idx];
-            if recv_msg.chunk_data.len() != recv_range.len() {
+            if recv_msg.element_count() != step_plan.recv_range.len() {
                 return Err(AgentError::Execution(format!(
                     "Received all-gather chunk len {} but expected {}",
-                    recv_msg.chunk_data.len(),
-                    recv_range.len()
+                    recv_msg.element_count(),
+                    step_plan.recv_range.len()
                 )));
             }
-            work_buffer[recv_range.start..recv_range.end].copy_from_slice(&recv_msg.chunk_data);
+            copy_wire_f32_bytes_into_slice(
+                &mut work_buffer[step_plan.recv_range.start..step_plan.recv_range.end],
+                recv_msg.payload_bytes(),
+            );
         }
 
         info!("All-gather complete");
@@ -631,21 +799,56 @@ impl<'a> WorkerRing<'a> {
         job_id: Uuid,
         layer_idx: u32,
     ) -> Result<CollectiveMatrix> {
-        self.drain_background_transfers().await?;
+        self.reap_completed_background_transfers().await?;
         if self.total_workers <= 1 {
             self.last_run_metrics = RingAllReduceMetrics::default();
             return Ok(partial_result);
         }
+        if self.total_workers == 2 {
+            let mut run_metrics = RingAllReduceMetrics::default();
+            run_metrics.collective_operations = 1;
+            run_metrics.collective_worker_participants = 2;
+            run_metrics.pairwise_fast_path_operations = 1;
+            let step_started = std::time::Instant::now();
+            let (recv_msg, send_wait_ms, receive_wait_ms) = self
+                .send_chunk_to_right_recv_from_left(
+                    CollectiveLane::ReduceScatter,
+                    job_id,
+                    layer_idx,
+                    0,
+                    0,
+                    0,
+                    partial_result.host_range(0..partial_result.len()),
+                )
+                .await?;
+            run_metrics.reduce_scatter_step_time_ms += step_started.elapsed().as_millis() as u64;
+            run_metrics.send_wait_time_ms += send_wait_ms;
+            run_metrics.receive_wait_time_ms += receive_wait_ms;
+            run_metrics.bytes_sent += (partial_result.len() * std::mem::size_of::<f32>()) as u64;
+            run_metrics.bytes_received += recv_msg.payload_bytes().len() as u64;
+            if recv_msg.element_count() != partial_result.len() {
+                return Err(AgentError::Execution(format!(
+                    "Received pairwise all-reduce matrix chunk len {} but expected {}",
+                    recv_msg.element_count(),
+                    partial_result.len()
+                )));
+            }
+            partial_result.accumulate_range_from_wire_bytes(
+                0..partial_result.len(),
+                recv_msg.payload_bytes(),
+            );
+            self.last_run_metrics = run_metrics;
+            return Ok(partial_result);
+        }
         let n = self.total_workers as usize;
-        let my_pos = self.my_position as usize;
         let mut run_metrics = RingAllReduceMetrics::default();
-        let chunk_ranges = partial_result.chunk_ranges(n);
+        run_metrics.collective_operations = 1;
+        run_metrics.collective_worker_participants = self.total_workers as u64;
+        run_metrics.larger_ring_operations = 1;
+        let plan = self.cached_collective_plan_for_len(partial_result.len());
 
         for step in 0..(n - 1) {
-            let send_idx = (my_pos + n - step) % n;
-            let recv_idx = (my_pos + n - step - 1) % n;
-            let send_range = &chunk_ranges[send_idx];
-            let send_shape = [send_range.len()];
+            let step_plan = &plan.reduce_scatter_steps[step];
 
             let step_started = std::time::Instant::now();
             let (recv_msg, send_wait_ms, receive_wait_ms) = self
@@ -654,31 +857,33 @@ impl<'a> WorkerRing<'a> {
                     job_id,
                     layer_idx,
                     step as u32,
-                    recv_idx as u32,
-                    partial_result.host_range(send_range.clone()),
-                    &send_shape,
+                    step_plan.send_slot,
+                    step_plan.recv_slot,
+                    partial_result.host_range(step_plan.send_range.clone()),
                 )
                 .await?;
             run_metrics.reduce_scatter_step_time_ms += step_started.elapsed().as_millis() as u64;
             run_metrics.send_wait_time_ms += send_wait_ms;
             run_metrics.receive_wait_time_ms += receive_wait_ms;
+            run_metrics.bytes_sent +=
+                (step_plan.send_range.len() * std::mem::size_of::<f32>()) as u64;
+            run_metrics.bytes_received += recv_msg.payload_bytes().len() as u64;
 
-            let recv_range = &chunk_ranges[recv_idx];
-            if recv_msg.chunk_data.len() != recv_range.len() {
+            if recv_msg.element_count() != step_plan.recv_range.len() {
                 return Err(AgentError::Execution(format!(
                     "Received reduce-scatter chunk len {} but expected {}",
-                    recv_msg.chunk_data.len(),
-                    recv_range.len()
+                    recv_msg.element_count(),
+                    step_plan.recv_range.len()
                 )));
             }
-            partial_result.accumulate_range(recv_range.clone(), &recv_msg.chunk_data);
+            partial_result.accumulate_range_from_wire_bytes(
+                step_plan.recv_range.clone(),
+                recv_msg.payload_bytes(),
+            );
         }
 
         for step in 0..(n - 1) {
-            let send_idx = (my_pos + n - step + 1) % n;
-            let recv_idx = (my_pos + n - step) % n;
-            let send_range = &chunk_ranges[send_idx];
-            let send_shape = [send_range.len()];
+            let step_plan = &plan.all_gather_steps[step];
 
             let step_started = std::time::Instant::now();
             let (recv_msg, send_wait_ms, receive_wait_ms) = self
@@ -687,24 +892,27 @@ impl<'a> WorkerRing<'a> {
                     job_id,
                     layer_idx,
                     step as u32,
-                    recv_idx as u32,
-                    partial_result.host_range(send_range.clone()),
-                    &send_shape,
+                    step_plan.send_slot,
+                    step_plan.recv_slot,
+                    partial_result.host_range(step_plan.send_range.clone()),
                 )
                 .await?;
             run_metrics.all_gather_step_time_ms += step_started.elapsed().as_millis() as u64;
             run_metrics.send_wait_time_ms += send_wait_ms;
             run_metrics.receive_wait_time_ms += receive_wait_ms;
+            run_metrics.bytes_sent +=
+                (step_plan.send_range.len() * std::mem::size_of::<f32>()) as u64;
+            run_metrics.bytes_received += recv_msg.payload_bytes().len() as u64;
 
-            let recv_range = &chunk_ranges[recv_idx];
-            if recv_msg.chunk_data.len() != recv_range.len() {
+            if recv_msg.element_count() != step_plan.recv_range.len() {
                 return Err(AgentError::Execution(format!(
                     "Received all-gather chunk len {} but expected {}",
-                    recv_msg.chunk_data.len(),
-                    recv_range.len()
+                    recv_msg.element_count(),
+                    step_plan.recv_range.len()
                 )));
             }
-            partial_result.copy_range_from_slice(recv_range.clone(), &recv_msg.chunk_data);
+            partial_result
+                .copy_range_from_wire_bytes(step_plan.recv_range.clone(), recv_msg.payload_bytes());
         }
 
         self.last_run_metrics = run_metrics;
@@ -736,6 +944,7 @@ impl<'a> WorkerRing<'a> {
     /// Uses a ring-based barrier where each worker sends a message to its
     /// right neighbor and waits for a message from its left neighbor.
     pub async fn barrier_sync(&mut self, job_id: Uuid, layer_idx: u32) -> Result<()> {
+        self.reap_completed_background_transfers().await?;
         self.drain_background_transfers().await?;
         if self.total_workers <= 1 {
             return Ok(());
@@ -747,17 +956,18 @@ impl<'a> WorkerRing<'a> {
                 layer_idx,
                 0,
                 0,
+                0,
                 &[self.my_position as f32],
-                &[1],
             )
             .await?;
 
         // Verify received from left neighbor
         let expected_pos = (self.my_position + self.total_workers - 1) % self.total_workers;
-        if received.chunk_data[0] as u32 != expected_pos {
+        let received_value = received.first_f32()? as u32;
+        if received_value != expected_pos {
             warn!(
                 "Barrier sync received from unexpected peer: got {}, expected {}",
-                received.chunk_data[0] as u32, expected_pos
+                received_value, expected_pos
             );
         }
 
@@ -809,7 +1019,6 @@ impl<'a> WorkerRing<'a> {
         step: u32,
         slot: u32,
         chunk_data: Vec<f32>,
-        chunk_shape: Vec<usize>,
     ) -> Result<()> {
         self.send_background_eligible_lane(
             CollectiveLane::BulkTransfer,
@@ -818,7 +1027,6 @@ impl<'a> WorkerRing<'a> {
             step,
             slot,
             chunk_data,
-            chunk_shape,
         )
         .await
     }
@@ -830,7 +1038,6 @@ impl<'a> WorkerRing<'a> {
         step: u32,
         slot: u32,
         chunk_data: Vec<f32>,
-        chunk_shape: Vec<usize>,
     ) -> Result<()> {
         self.send_background_eligible_lane(
             CollectiveLane::Checkpoint,
@@ -839,7 +1046,6 @@ impl<'a> WorkerRing<'a> {
             step,
             slot,
             chunk_data,
-            chunk_shape,
         )
         .await
     }
@@ -867,6 +1073,27 @@ impl<'a> WorkerRing<'a> {
         Ok(())
     }
 
+    async fn reap_completed_background_transfers(&mut self) -> Result<()> {
+        let mut idx = 0usize;
+        while idx < self.background_transfers.len() {
+            if self.background_transfers[idx].is_finished() {
+                let transfer = self.background_transfers.swap_remove(idx);
+                debug!(
+                    lane = ?transfer.lane(),
+                    collective_id = %transfer.collective_id(),
+                    step = transfer.step(),
+                    slot = transfer.slot(),
+                    stream_id = transfer.stream_id(),
+                    "reaping completed background serving-lane transfer"
+                );
+                transfer.wait().await?;
+            } else {
+                idx += 1;
+            }
+        }
+        Ok(())
+    }
+
     fn serving_transport(&self) -> Result<&ServingSessionTransport> {
         self.serving_transport.as_ref().ok_or_else(|| {
             AgentError::Execution(
@@ -881,30 +1108,29 @@ impl<'a> WorkerRing<'a> {
         collective_id: Uuid,
         layer_idx: u32,
         step: u32,
-        slot: u32,
+        send_slot: u32,
+        recv_slot: u32,
         chunk_data: &[f32],
-        chunk_shape: &[usize],
-    ) -> Result<(ServingFrame, u64, u64)> {
+    ) -> Result<(ServingFrameBytes, u64, u64)> {
         let expected_sender_position =
             (self.my_position + self.total_workers - 1) % self.total_workers;
         let transport = self.serving_transport()?.clone();
-        let stream_id = transport.stream_id_for(lane, step, slot);
-        let send_started = std::time::Instant::now();
-        let recv_started = std::time::Instant::now();
-        let (send_result, inbound) = tokio::join!(
+        let send_stream_id = transport.stream_id_for(lane, step, send_slot);
+        let recv_stream_id = transport.stream_id_for(lane, step, recv_slot);
+        let io_started = std::time::Instant::now();
+        let ((send_result, send_wait_ms), (inbound, receive_wait_ms)) = tokio::join!(
             async {
-                match lane {
+                let result = match lane {
                     CollectiveLane::ReduceScatter => {
                         transport
                             .send_reduce_scatter_chunk(
                                 collective_id,
                                 layer_idx,
                                 step,
-                                slot,
-                                stream_id,
+                                send_slot,
+                                send_stream_id,
                                 self.my_position,
                                 chunk_data,
-                                chunk_shape,
                             )
                             .await
                     }
@@ -914,11 +1140,10 @@ impl<'a> WorkerRing<'a> {
                                 collective_id,
                                 layer_idx,
                                 step,
-                                slot,
-                                stream_id,
+                                send_slot,
+                                send_stream_id,
                                 self.my_position,
                                 chunk_data,
-                                chunk_shape,
                             )
                             .await
                     }
@@ -928,11 +1153,10 @@ impl<'a> WorkerRing<'a> {
                                 collective_id,
                                 layer_idx,
                                 step,
-                                slot,
-                                stream_id,
+                                send_slot,
+                                send_stream_id,
                                 self.my_position,
                                 chunk_data,
-                                chunk_shape,
                             )
                             .await
                     }
@@ -940,26 +1164,28 @@ impl<'a> WorkerRing<'a> {
                         "Unsupported ring collective lane {:?}",
                         other
                     ))),
-                }
+                };
+                (result, io_started.elapsed().as_millis() as u64)
             },
-            transport.recv_frame(ServingReceiveSpec {
-                collective_id,
-                lane,
-                layer_idx,
-                step,
-                slot,
-                stream_id,
-                expected_sender_position,
-            })
+            async {
+                let result = transport
+                    .recv_frame_bytes(ServingReceiveSpec {
+                        collective_id,
+                        lane,
+                        layer_idx,
+                        step,
+                        slot: recv_slot,
+                        stream_id: recv_stream_id,
+                        expected_sender_position,
+                    })
+                    .await;
+                (result, io_started.elapsed().as_millis() as u64)
+            }
         );
         send_result?;
         let inbound = inbound?;
 
-        Ok((
-            inbound,
-            send_started.elapsed().as_millis() as u64,
-            recv_started.elapsed().as_millis() as u64,
-        ))
+        Ok((inbound, send_wait_ms, receive_wait_ms))
     }
 
     pub fn last_run_metrics(&self) -> RingAllReduceMetrics {
@@ -970,6 +1196,52 @@ impl<'a> WorkerRing<'a> {
         self.collective_profile
     }
 
+    fn cached_collective_plan_for_len(&mut self, len: usize) -> Arc<CachedChunkLayout> {
+        if let Some(cached) = self.cached_chunk_layout.as_ref() {
+            if cached.len == len
+                && cached.total_workers == self.total_workers
+                && cached.my_position == self.my_position
+            {
+                return Arc::clone(cached);
+            }
+        }
+
+        let n = self.total_workers as usize;
+        let my_pos = self.my_position as usize;
+        let ranges = chunk_ranges_for_len(len, n);
+        let mut reduce_scatter_steps = Vec::with_capacity(n.saturating_sub(1));
+        let mut all_gather_steps = Vec::with_capacity(n.saturating_sub(1));
+        for step in 0..(n - 1) {
+            let rs_send_idx = (my_pos + n - step) % n;
+            let rs_recv_idx = (my_pos + n - step - 1) % n;
+            reduce_scatter_steps.push(CachedCollectiveStep {
+                send_slot: rs_send_idx as u32,
+                recv_slot: rs_recv_idx as u32,
+                send_range: ranges[rs_send_idx].clone(),
+                recv_range: ranges[rs_recv_idx].clone(),
+            });
+
+            let ag_send_idx = (my_pos + n - step + 1) % n;
+            let ag_recv_idx = (my_pos + n - step) % n;
+            all_gather_steps.push(CachedCollectiveStep {
+                send_slot: ag_send_idx as u32,
+                recv_slot: ag_recv_idx as u32,
+                send_range: ranges[ag_send_idx].clone(),
+                recv_range: ranges[ag_recv_idx].clone(),
+            });
+        }
+
+        let plan = Arc::new(CachedChunkLayout {
+            len,
+            total_workers: self.total_workers,
+            my_position: self.my_position,
+            reduce_scatter_steps,
+            all_gather_steps,
+        });
+        self.cached_chunk_layout = Some(Arc::clone(&plan));
+        plan
+    }
+
     async fn send_background_eligible_lane(
         &mut self,
         lane: CollectiveLane,
@@ -978,8 +1250,8 @@ impl<'a> WorkerRing<'a> {
         step: u32,
         slot: u32,
         chunk_data: Vec<f32>,
-        chunk_shape: Vec<usize>,
     ) -> Result<()> {
+        self.reap_completed_background_transfers().await?;
         let plan = self.collective_overlap_plan(lane);
         let stream_id = self.serving_transport()?.stream_id_for(lane, step, slot);
         let transport = self.serving_transport()?.clone();
@@ -1002,7 +1274,6 @@ impl<'a> WorkerRing<'a> {
                         stream_id,
                         self.my_position,
                         chunk_data,
-                        chunk_shape,
                     ));
                 Ok(())
             }
@@ -1023,7 +1294,6 @@ impl<'a> WorkerRing<'a> {
                     stream_id,
                     self.my_position,
                     chunk_data,
-                    chunk_shape,
                 ));
                 Ok(())
             }
@@ -1037,7 +1307,6 @@ impl<'a> WorkerRing<'a> {
                         stream_id,
                         self.my_position,
                         &chunk_data,
-                        &chunk_shape,
                     )
                     .await
             }
@@ -1051,7 +1320,6 @@ impl<'a> WorkerRing<'a> {
                         stream_id,
                         self.my_position,
                         &chunk_data,
-                        &chunk_shape,
                     )
                     .await
             }
@@ -1061,6 +1329,23 @@ impl<'a> WorkerRing<'a> {
             ))),
         }
     }
+}
+
+fn chunk_ranges_for_len(len: usize, n: usize) -> Vec<Range<usize>> {
+    assert!(n > 0, "Number of chunks must be positive");
+    let chunk_size = len.div_ceil(n);
+    let mut ranges = Vec::with_capacity(n);
+    let mut start = 0usize;
+    for _ in 0..n {
+        let end = if chunk_size == 0 {
+            start
+        } else {
+            (start + chunk_size).min(len)
+        };
+        ranges.push(start..end);
+        start = end;
+    }
+    ranges
 }
 
 #[cfg(test)]
@@ -1217,6 +1502,7 @@ mod tests {
             InferenceRuntimeMode::ThroughputFirst,
             ExecutionProviderKind::Cuda,
             LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
+            None,
             &mut plane,
         );
         cuda_ring.prepare_serving_group_channels().await.unwrap();
@@ -1255,17 +1541,455 @@ mod tests {
             InferenceRuntimeMode::ThroughputFirst,
             ExecutionProviderKind::Cuda,
             LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
+            None,
             &mut plane,
         );
         ring.prepare_serving_group_channels().await.unwrap();
 
-        ring.send_checkpoint(Uuid::new_v4(), 0, 0, 0, vec![9.0], vec![1])
+        ring.send_checkpoint(Uuid::new_v4(), 0, 0, 0, vec![9.0])
             .await
             .unwrap();
         assert_eq!(ring.background_transfer_count(), 1);
 
         ring.drain_background_transfers().await.unwrap();
         assert_eq!(ring.background_transfer_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_completed_background_checkpoint_transfers_are_reaped_without_full_drain() {
+        let mut plane = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let peer_id = PeerId::random();
+        let addr = plane.local_addr();
+        let mut ring = WorkerRing::new(
+            0,
+            2,
+            peer_id,
+            peer_id,
+            addr,
+            addr,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cuda,
+            LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
+            None,
+            &mut plane,
+        );
+        ring.prepare_serving_group_channels().await.unwrap();
+
+        ring.send_checkpoint(Uuid::new_v4(), 0, 0, 0, vec![9.0])
+            .await
+            .unwrap();
+        assert_eq!(ring.background_transfer_count(), 1);
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        ring.reap_completed_background_transfers().await.unwrap();
+        assert_eq!(ring.background_transfer_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_decode_collectives_do_not_eagerly_drain_background_checkpoint_transfers() {
+        let transport_plane = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let session = transport_plane
+            .serving_transport_for_neighbors(
+                transport_plane.local_addr(),
+                transport_plane.local_addr(),
+                InferenceRuntimeMode::ThroughputFirst,
+                ExecutionProviderKind::Cuda,
+            )
+            .await
+            .unwrap();
+        let mut plane_a = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let mut plane_b = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let peer_a = PeerId::random();
+        let peer_b = PeerId::random();
+        let addr_a = plane_a.local_addr();
+        let addr_b = plane_b.local_addr();
+        let mut ring_a = WorkerRing::new(
+            0,
+            2,
+            peer_b,
+            peer_b,
+            addr_b,
+            addr_b,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cuda,
+            LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
+            Some(session.clone()),
+            &mut plane_a,
+        );
+        let mut ring_b = WorkerRing::new(
+            1,
+            2,
+            peer_a,
+            peer_a,
+            addr_a,
+            addr_a,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cuda,
+            LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
+            Some(session),
+            &mut plane_b,
+        );
+
+        ring_a
+            .send_checkpoint(Uuid::new_v4(), 0, 0, 0, vec![9.0])
+            .await
+            .unwrap();
+        assert_eq!(ring_a.background_transfer_count(), 1);
+
+        let collective_id = Uuid::new_v4();
+        let (result_a, result_b) = tokio::join!(
+            ring_a.ring_all_reduce_with_timeout(
+                Tensor::new(vec![1.0, 2.0], vec![2]),
+                collective_id,
+                0,
+                Duration::from_secs(5),
+            ),
+            ring_b.ring_all_reduce_with_timeout(
+                Tensor::new(vec![10.0, 20.0], vec![2]),
+                collective_id,
+                0,
+                Duration::from_secs(5),
+            )
+        );
+        assert_eq!(result_a.unwrap().data, vec![11.0, 22.0]);
+        assert_eq!(result_b.unwrap().data, vec![11.0, 22.0]);
+        assert_eq!(ring_a.background_transfer_count(), 1);
+
+        ring_a.drain_background_transfers().await.unwrap();
+        assert_eq!(ring_a.background_transfer_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_two_worker_matrix_allreduce_uses_single_exchange() {
+        let transport_plane = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let session = transport_plane
+            .serving_transport_for_neighbors(
+                transport_plane.local_addr(),
+                transport_plane.local_addr(),
+                InferenceRuntimeMode::ThroughputFirst,
+                ExecutionProviderKind::Cuda,
+            )
+            .await
+            .unwrap();
+        let mut plane_a = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let mut plane_b = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let peer_a = PeerId::random();
+        let peer_b = PeerId::random();
+        let addr_a = plane_a.local_addr();
+        let addr_b = plane_b.local_addr();
+        let mut ring_a = WorkerRing::new(
+            0,
+            2,
+            peer_b,
+            peer_b,
+            addr_b,
+            addr_b,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cuda,
+            LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
+            Some(session.clone()),
+            &mut plane_a,
+        );
+        let mut ring_b = WorkerRing::new(
+            1,
+            2,
+            peer_a,
+            peer_a,
+            addr_a,
+            addr_a,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cuda,
+            LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
+            Some(session),
+            &mut plane_b,
+        );
+
+        let collective_id = Uuid::new_v4();
+        let (result_a, result_b) = tokio::join!(
+            ring_a.ring_all_reduce_matrix_with_timeout(
+                CollectiveMatrix::new(vec![1.0, 2.0, 3.0, 4.0], 2, 2),
+                collective_id,
+                0,
+                Duration::from_secs(5),
+            ),
+            ring_b.ring_all_reduce_matrix_with_timeout(
+                CollectiveMatrix::new(vec![10.0, 20.0, 30.0, 40.0], 2, 2),
+                collective_id,
+                0,
+                Duration::from_secs(5),
+            )
+        );
+        let result_a = result_a.unwrap();
+        let result_b = result_b.unwrap();
+
+        assert_eq!(result_a.to_host_vec(), vec![11.0, 22.0, 33.0, 44.0]);
+        assert_eq!(result_b.to_host_vec(), vec![11.0, 22.0, 33.0, 44.0]);
+        assert_eq!(ring_a.last_run_metrics().all_gather_step_time_ms, 0);
+        assert_eq!(ring_b.last_run_metrics().all_gather_step_time_ms, 0);
+    }
+
+    #[test]
+    fn test_cached_collective_step_supports_equality_for_regressions() {
+        let step = CachedCollectiveStep {
+            send_slot: 0,
+            recv_slot: 2,
+            send_range: 8..12,
+            recv_range: 4..8,
+        };
+        assert_eq!(step, step.clone());
+    }
+
+    #[tokio::test]
+    async fn test_cached_collective_plan_is_reused_for_matching_three_worker_collectives() {
+        let mut plane = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let peer_id = PeerId::random();
+        let addr = plane.local_addr();
+        let mut ring = WorkerRing::new(
+            0,
+            3,
+            peer_id,
+            peer_id,
+            addr,
+            addr,
+            InferenceRuntimeMode::LatencyFirst,
+            ExecutionProviderKind::Metal,
+            LocalExecutorContract::for_provider(ExecutionProviderKind::Metal),
+            None,
+            &mut plane,
+        );
+
+        let first = ring.cached_collective_plan_for_len(12);
+        assert_eq!(first.reduce_scatter_steps.len(), 2);
+        assert_eq!(first.all_gather_steps.len(), 2);
+        assert_eq!(
+            first.reduce_scatter_steps[0],
+            CachedCollectiveStep {
+                send_slot: 0,
+                recv_slot: 2,
+                send_range: 0..4,
+                recv_range: 8..12,
+            }
+        );
+        assert_eq!(
+            first.all_gather_steps[0],
+            CachedCollectiveStep {
+                send_slot: 1,
+                recv_slot: 0,
+                send_range: 4..8,
+                recv_range: 0..4,
+            }
+        );
+
+        let second = ring.cached_collective_plan_for_len(12);
+        assert_eq!(first.reduce_scatter_steps, second.reduce_scatter_steps);
+        assert_eq!(first.all_gather_steps, second.all_gather_steps);
+    }
+
+    #[tokio::test]
+    async fn test_three_worker_matrix_allreduce_uses_correct_send_slots() {
+        let mut plane_a = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let mut plane_b = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let mut plane_c = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+
+        let addr_a = plane_a.local_addr();
+        let addr_b = plane_b.local_addr();
+        let addr_c = plane_c.local_addr();
+        let peer_a = PeerId::random();
+        let peer_b = PeerId::random();
+        let peer_c = PeerId::random();
+
+        let mut ring_a = WorkerRing::new(
+            0,
+            3,
+            peer_c,
+            peer_b,
+            addr_c,
+            addr_b,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cuda,
+            LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
+            None,
+            &mut plane_a,
+        );
+        let mut ring_b = WorkerRing::new(
+            1,
+            3,
+            peer_a,
+            peer_c,
+            addr_a,
+            addr_c,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cuda,
+            LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
+            None,
+            &mut plane_b,
+        );
+        let mut ring_c = WorkerRing::new(
+            2,
+            3,
+            peer_b,
+            peer_a,
+            addr_b,
+            addr_a,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cuda,
+            LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
+            None,
+            &mut plane_c,
+        );
+
+        ring_a.prepare_serving_group_channels().await.unwrap();
+        ring_b.prepare_serving_group_channels().await.unwrap();
+        ring_c.prepare_serving_group_channels().await.unwrap();
+
+        let collective_id = Uuid::new_v4();
+        let (result_a, result_b, result_c) = tokio::join!(
+            ring_a.ring_all_reduce_matrix_with_timeout(
+                CollectiveMatrix::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 3),
+                collective_id,
+                0,
+                Duration::from_secs(5),
+            ),
+            ring_b.ring_all_reduce_matrix_with_timeout(
+                CollectiveMatrix::new(vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0], 2, 3),
+                collective_id,
+                0,
+                Duration::from_secs(5),
+            ),
+            ring_c.ring_all_reduce_matrix_with_timeout(
+                CollectiveMatrix::new(vec![100.0, 200.0, 300.0, 400.0, 500.0, 600.0], 2, 3),
+                collective_id,
+                0,
+                Duration::from_secs(5),
+            )
+        );
+        let result_a = result_a.unwrap();
+        let result_b = result_b.unwrap();
+        let result_c = result_c.unwrap();
+        let expected = vec![111.0, 222.0, 333.0, 444.0, 555.0, 666.0];
+
+        assert_eq!(result_a.to_host_vec(), expected);
+        assert_eq!(result_b.to_host_vec(), expected);
+        assert_eq!(result_c.to_host_vec(), expected);
+    }
+
+    #[tokio::test]
+    async fn test_three_worker_tensor_allreduce_uses_live_transport_ring() {
+        let mut plane_a = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let mut plane_b = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+        let mut plane_c = TensorPlane::bind(TensorPlaneConfig::default())
+            .await
+            .unwrap();
+
+        let addr_a = plane_a.local_addr();
+        let addr_b = plane_b.local_addr();
+        let addr_c = plane_c.local_addr();
+        let peer_a = PeerId::random();
+        let peer_b = PeerId::random();
+        let peer_c = PeerId::random();
+
+        let mut ring_a = WorkerRing::new(
+            0,
+            3,
+            peer_c,
+            peer_b,
+            addr_c,
+            addr_b,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cuda,
+            LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
+            None,
+            &mut plane_a,
+        );
+        let mut ring_b = WorkerRing::new(
+            1,
+            3,
+            peer_a,
+            peer_c,
+            addr_a,
+            addr_c,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cuda,
+            LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
+            None,
+            &mut plane_b,
+        );
+        let mut ring_c = WorkerRing::new(
+            2,
+            3,
+            peer_b,
+            peer_a,
+            addr_b,
+            addr_a,
+            InferenceRuntimeMode::ThroughputFirst,
+            ExecutionProviderKind::Cuda,
+            LocalExecutorContract::for_provider(ExecutionProviderKind::Cuda),
+            None,
+            &mut plane_c,
+        );
+
+        ring_a.prepare_serving_group_channels().await.unwrap();
+        ring_b.prepare_serving_group_channels().await.unwrap();
+        ring_c.prepare_serving_group_channels().await.unwrap();
+
+        let collective_id = Uuid::new_v4();
+        let (result_a, result_b, result_c) = tokio::join!(
+            ring_a.ring_all_reduce_with_timeout(
+                Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![6]),
+                collective_id,
+                0,
+                Duration::from_secs(5),
+            ),
+            ring_b.ring_all_reduce_with_timeout(
+                Tensor::new(vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0], vec![6]),
+                collective_id,
+                0,
+                Duration::from_secs(5),
+            ),
+            ring_c.ring_all_reduce_with_timeout(
+                Tensor::new(vec![100.0, 200.0, 300.0, 400.0, 500.0, 600.0], vec![6]),
+                collective_id,
+                0,
+                Duration::from_secs(5),
+            )
+        );
+        let result_a = result_a.unwrap();
+        let result_b = result_b.unwrap();
+        let result_c = result_c.unwrap();
+        let expected = vec![111.0, 222.0, 333.0, 444.0, 555.0, 666.0];
+
+        assert_eq!(result_a.data, expected);
+        assert_eq!(result_b.data, expected);
+        assert_eq!(result_c.data, expected);
+        assert_eq!(result_a.shape, vec![6]);
+        assert_eq!(result_b.shape, vec![6]);
+        assert_eq!(result_c.shape, vec![6]);
     }
 
     // ============== Ring All-Reduce Logic Tests ==============
