@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::errors::Result;
 use crate::executor::ring_allreduce::{RingAllReduceMetrics, WorkerRing};
-use crate::provider::{selected_execution_provider, ExecutionProviderKind};
+use crate::provider::{selected_backend_contract, ExecutionProviderKind};
 use candle_core::Tensor as CandleTensor;
 
 use super::engine::{BackendOptimizationProfile, LocalExecutorContract};
@@ -212,7 +212,9 @@ impl CandleExecutionBackend {
         total_workers: u32,
         allreduce_timeout: std::time::Duration,
     ) -> Result<Self> {
-        let provider = selected_execution_provider().unwrap_or(ExecutionProviderKind::Cpu);
+        let selected_contract = selected_backend_contract()
+            .unwrap_or_else(|| crate::provider::BackendContractDescriptor::for_provider(ExecutionProviderKind::Cpu));
+        let provider = selected_contract.provider;
         Ok(Self {
             model_id: model.model_id().to_string(),
             provider,

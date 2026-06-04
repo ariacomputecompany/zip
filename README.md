@@ -118,13 +118,15 @@ cargo test
 ## Example
 
 ```rust
-use zip::{default_execution_provider, detect_execution_providers, InferenceConfig};
+use zip::{default_execution_contract, detect_execution_providers, InferenceConfig};
 
 let providers = detect_execution_providers();
-let provider = default_execution_provider(&providers);
+let contract = default_execution_contract(&providers);
 let _config = InferenceConfig::default();
 
-assert!(providers.iter().any(|candidate| candidate.kind == provider));
+assert!(providers
+    .iter()
+    .any(|candidate| candidate.contract.contract_hash == contract.contract_hash));
 ```
 
 ## Open Source Notes

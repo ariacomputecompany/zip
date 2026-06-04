@@ -6,7 +6,7 @@ pub use capabilities::{DeviceCapabilities, Tier};
 use crate::connectivity::NetworkConnectivity;
 use crate::errors::{AgentError, Result};
 use crate::network::TensorPlaneProfile;
-use crate::provider::{resolve_requested_provider, ExecutionProviderKind};
+use crate::provider::{resolve_requested_contract, BackendContractDescriptor};
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -74,9 +74,9 @@ pub struct DeviceConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ExecutionConfig {
-    /// Explicit provider to run on this node. When omitted, MeshNet selects the
-    /// highest-priority available provider from the detected inventory.
-    pub preferred_provider: Option<ExecutionProviderKind>,
+    /// Explicit backend contract hash to run on this node. When omitted, MeshNet
+    /// selects the highest-priority available backend contract from the detected inventory.
+    pub preferred_backend_contract_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,9 +174,9 @@ impl DeviceConfig {
         }
     }
 
-    pub fn resolve_execution_provider(&self) -> Result<ExecutionProviderKind> {
-        resolve_requested_provider(
-            self.execution.preferred_provider,
+    pub fn resolve_execution_contract(&self) -> Result<BackendContractDescriptor> {
+        resolve_requested_contract(
+            self.execution.preferred_backend_contract_hash.as_deref(),
             &self.capabilities.execution_providers,
         )
     }
@@ -462,11 +462,17 @@ gpu_vram_mb = 0
 os = "linux"
 arch = "x86_64"
 execution_providers = [
-  {{ kind = "cpu", available = true }},
-  {{ kind = "metal", available = false, reason = "metal provider is only available on macOS" }},
-  {{ kind = "cuda", available = true }},
+  {{ kind = "cpu", available = true, contract = {{ provider = "cpu", compatibility_class = "cpu_portable", optimization_profile = "cpu_serial", supports_decode_microbatch = false, supports_paged_kv = false, supports_checkpoint_handoff = true, supports_device_sampling = false, fast_path_eligible = false, memory_model = "system_ram", contract_hash = "474a3c1ffb06ba99" }} }},
+  {{ kind = "metal", available = false, reason = "metal provider is only available on macOS", contract = {{ provider = "metal", compatibility_class = "metal_fast_path", optimization_profile = "metal_vectorized", supports_decode_microbatch = true, supports_paged_kv = true, supports_checkpoint_handoff = true, supports_device_sampling = true, fast_path_eligible = true, memory_model = "unified_memory", contract_hash = "0ef0f5ec0f7d3d8b" }} }},
+  {{ kind = "cuda", available = true, contract = {{ provider = "cuda", compatibility_class = "cuda_fast_path", optimization_profile = "cuda_fused", supports_decode_microbatch = true, supports_paged_kv = true, supports_checkpoint_handoff = true, supports_device_sampling = true, fast_path_eligible = true, memory_model = "discrete_vram", contract_hash = "a4b8c4f7f2f28c19" }} }},
 ]
-default_execution_provider = "cuda"
+provider_contracts = [
+  {{ provider = "cpu", compatibility_class = "cpu_portable", optimization_profile = "cpu_serial", supports_decode_microbatch = false, supports_paged_kv = false, supports_checkpoint_handoff = true, supports_device_sampling = false, fast_path_eligible = false, memory_model = "system_ram", contract_hash = "474a3c1ffb06ba99" }},
+  {{ provider = "metal", compatibility_class = "metal_fast_path", optimization_profile = "metal_vectorized", supports_decode_microbatch = true, supports_paged_kv = true, supports_checkpoint_handoff = true, supports_device_sampling = true, fast_path_eligible = true, memory_model = "unified_memory", contract_hash = "0ef0f5ec0f7d3d8b" }},
+  {{ provider = "cuda", compatibility_class = "cuda_fast_path", optimization_profile = "cuda_fused", supports_decode_microbatch = true, supports_paged_kv = true, supports_checkpoint_handoff = true, supports_device_sampling = true, fast_path_eligible = true, memory_model = "discrete_vram", contract_hash = "a4b8c4f7f2f28c19" }},
+]
+default_provider_contract_hash = "a4b8c4f7f2f28c19"
+memory_model = "discrete_vram"
 "#
         );
 

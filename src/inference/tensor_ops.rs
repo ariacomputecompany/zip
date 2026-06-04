@@ -8,7 +8,7 @@
 //! - Token embedding lookup
 
 use crate::errors::{AgentError, Result};
-use crate::provider::{selected_execution_provider, ExecutionProviderKind};
+use crate::provider::{selected_backend_contract, ExecutionProviderKind};
 use candle_core::{
     backend::BackendStorage, CustomOp1, DType, Device, Layout, Shape, Storage,
     Tensor as CandleTensor, D,
@@ -843,7 +843,9 @@ fn candle_error(err: candle_core::Error) -> AgentError {
 #[inline]
 fn is_cpu_provider() -> bool {
     matches!(
-        selected_execution_provider().unwrap_or(ExecutionProviderKind::Cpu),
+        selected_backend_contract()
+            .map(|contract| contract.provider)
+            .unwrap_or(ExecutionProviderKind::Cpu),
         ExecutionProviderKind::Cpu
     )
 }
@@ -860,7 +862,9 @@ pub(crate) fn execution_device() -> Result<&'static Device> {
 }
 
 fn init_execution_device() -> std::result::Result<Device, candle_core::Error> {
-    let provider = selected_execution_provider().unwrap_or(ExecutionProviderKind::Cpu);
+    let provider = selected_backend_contract()
+        .map(|contract| contract.provider)
+        .unwrap_or(ExecutionProviderKind::Cpu);
     match provider {
         ExecutionProviderKind::Cpu => Ok(Device::Cpu),
         ExecutionProviderKind::Cuda => {
