@@ -2,10 +2,12 @@ use crate::api::types::{
     AcknowledgeInferenceAssignmentRequest, ClaimInferenceAssignmentRequest,
     ClaimInferenceAssignmentResponse, DownloadInferenceSessionCheckpointResponse, HeartbeatRequest,
     HeartbeatResponse, InferenceExecutionLease, InferenceSessionCheckpointPayload,
-    ObserveDecodeQueueStateResponse, RegisterDeviceRequest, RegisterDeviceResponse,
-    ReleaseDecodeLeaseRequest, ReleaseDecodeLeaseResponse, RenewDecodeLeaseRequest,
-    RenewDecodeLeaseResponse, ReportInferenceAssignmentProgressRequest,
-    ReportInferenceAssignmentRequest, UploadInferenceSessionCheckpointRequest, WorkClaimMode,
+    ObserveDecodeQueueStateResponse, ObservePendingKvTransfersResponse, PendingKvTransferStatus,
+    RegisterDeviceRequest, RegisterDeviceResponse, ReleaseDecodeLeaseRequest,
+    ReleaseDecodeLeaseResponse, RenewDecodeLeaseRequest, RenewDecodeLeaseResponse,
+    ReportInferenceAssignmentProgressRequest, ReportInferenceAssignmentRequest,
+    ReportInferenceSessionKvTransferRequest, UploadInferenceSessionCheckpointRequest,
+    UploadInferenceSessionKvTransferPayloadRequest, WorkClaimMode,
 };
 use crate::connectivity::{
     build_direct_peer_candidates_from_records, filter_peer_advertisable_addrs,
@@ -20,6 +22,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{interval, sleep};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+fn heartbeat_interval() -> Duration {
+    std::env::var("MESHNET_HEARTBEAT_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_secs(2))
+}
 
 /// Client for registering and maintaining connection with control plane
 #[derive(Clone)]
@@ -233,11 +244,11 @@ impl RegistrationClient {
 
     /// Run heartbeat loop indefinitely
     ///
-    /// Sends heartbeats every 5 seconds. Does not fail on errors, just logs warnings.
+    /// Sends heartbeats on a short interval so serving-group failover can converge quickly.
     pub async fn heartbeat_loop(self, config: DeviceConfig) {
         info!(device_id = %config.device_id, "Starting heartbeat loop");
 
-        let mut tick = interval(Duration::from_secs(5));
+        let mut tick = interval(heartbeat_interval());
 
         loop {
             tick.tick().await;
@@ -504,6 +515,92 @@ impl RegistrationClient {
         Ok(())
     }
 
+    pub async fn report_inference_session_kv_transfer(
+        &self,
+        job_id: Uuid,
+        request: ReportInferenceSessionKvTransferRequest,
+    ) -> Result<()> {
+        let url = format!(
+            "{}/api/inference/jobs/{}/session-kv-transfers/report",
+            self.control_plane_url, job_id
+        );
+        let response = self
+            .client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| AgentError::Http(format!("Session KV transfer report failed: {}", e)))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(AgentError::Network(format!(
+                "Session KV transfer report failed: HTTP {}: {}",
+                status, error_text
+            )));
+        }
+
+        Ok(())
+    }
+
+    pub async fn observe_pending_kv_transfers(
+        &self,
+        device_id: Uuid,
+        network_id: &str,
+    ) -> Result<Option<ObservePendingKvTransfersResponse>> {
+        let url = format!(
+            "{}/api/inference/session-kv-transfers/pending",
+            self.control_plane_url
+        );
+        self.get_optional_json(
+            &url,
+            &[
+                ("device_id", device_id.to_string()),
+                ("network_id", network_id.to_string()),
+            ],
+            "Pending KV transfer observation failed",
+        )
+        .await
+    }
+
+    pub async fn upload_inference_session_kv_transfer_payload(
+        &self,
+        job_id: Uuid,
+        request: UploadInferenceSessionKvTransferPayloadRequest,
+    ) -> Result<()> {
+        let url = format!(
+            "{}/api/inference/jobs/{}/session-kv-transfers/payloads",
+            self.control_plane_url, job_id
+        );
+        let response = self
+            .client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| {
+                AgentError::Http(format!("Session KV transfer payload upload failed: {}", e))
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(AgentError::Network(format!(
+                "Session KV transfer payload upload failed: HTTP {}: {}",
+                status, error_text
+            )));
+        }
+
+        Ok(())
+    }
+
     pub async fn download_inference_session_checkpoint(
         &self,
         job_id: Uuid,
@@ -548,6 +645,71 @@ impl RegistrationClient {
             Ok(Some(checkpoint))
         } else {
             Ok(None)
+        }
+    }
+
+    pub async fn download_inference_session_kv_transfer_payload(
+        &self,
+        job_id: Uuid,
+        transfer_id: &str,
+        device_id: Uuid,
+    ) -> Result<Option<(PendingKvTransferStatus, Vec<u8>)>> {
+        let url = format!(
+            "{}/api/inference/jobs/{}/session-kv-transfers/{}/payload",
+            self.control_plane_url, job_id, transfer_id
+        );
+        let response = self
+            .client
+            .get(&url)
+            .query(&[("device_id", device_id.to_string())])
+            .send()
+            .await
+            .map_err(|e| {
+                AgentError::Http(format!(
+                    "Session KV transfer payload download failed: {}",
+                    e
+                ))
+            })?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(AgentError::Network(format!(
+                "Session KV transfer payload download failed: HTTP {}: {}",
+                status, error_text
+            )));
+        }
+
+        let body: crate::api::types::DownloadInferenceSessionKvTransferPayloadResponse =
+            response.json().await.map_err(|e| {
+                AgentError::Serialization(format!(
+                    "Failed to parse session KV transfer payload download: {}",
+                    e
+                ))
+            })?;
+
+        match (body.transfer, body.payload_hex) {
+            (Some(transfer), Some(payload_hex)) => {
+                let payload = hex::decode(&payload_hex).map_err(|e| {
+                    AgentError::Serialization(format!(
+                        "Downloaded session KV transfer payload had invalid hex: {}",
+                        e
+                    ))
+                })?;
+                Ok(Some((transfer, payload)))
+            }
+            (None, None) => Ok(None),
+            _ => Err(AgentError::Serialization(
+                "Session KV transfer payload download returned incomplete payload state"
+                    .to_string(),
+            )),
         }
     }
 }
@@ -657,17 +819,13 @@ mod tests {
                     kind: ExecutionProviderKind::Metal,
                     available: true,
                     reason: None,
-                    contract: BackendContractDescriptor::for_provider(
-                        ExecutionProviderKind::Metal,
-                    ),
+                    contract: BackendContractDescriptor::for_provider(ExecutionProviderKind::Metal),
                 },
                 ExecutionProviderInfo {
                     kind: ExecutionProviderKind::Cuda,
                     available: false,
                     reason: Some("cuda provider is only available on Linux builds".to_string()),
-                    contract: BackendContractDescriptor::for_provider(
-                        ExecutionProviderKind::Cuda,
-                    ),
+                    contract: BackendContractDescriptor::for_provider(ExecutionProviderKind::Cuda),
                 },
             ],
             provider_contracts: vec![

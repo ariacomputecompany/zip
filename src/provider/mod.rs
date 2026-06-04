@@ -180,7 +180,9 @@ pub fn detect_execution_providers() -> Vec<ExecutionProviderInfo> {
     providers
 }
 
-pub fn default_execution_contract(providers: &[ExecutionProviderInfo]) -> BackendContractDescriptor {
+pub fn default_execution_contract(
+    providers: &[ExecutionProviderInfo],
+) -> BackendContractDescriptor {
     providers
         .iter()
         .find(|provider| provider.available && provider.kind != ExecutionProviderKind::Cpu)
@@ -196,9 +198,9 @@ pub fn resolve_requested_contract(
         Some(contract_hash) => providers
             .iter()
             .find(|provider| provider.contract.contract_hash == contract_hash),
-        None => providers
-            .iter()
-            .find(|provider| provider.contract.contract_hash == default_execution_contract(providers).contract_hash),
+        None => providers.iter().find(|provider| {
+            provider.contract.contract_hash == default_execution_contract(providers).contract_hash
+        }),
     }
     .ok_or_else(|| {
         let selected = requested_contract_hash.unwrap_or("<default>");

@@ -212,8 +212,9 @@ impl CandleExecutionBackend {
         total_workers: u32,
         allreduce_timeout: std::time::Duration,
     ) -> Result<Self> {
-        let selected_contract = selected_backend_contract()
-            .unwrap_or_else(|| crate::provider::BackendContractDescriptor::for_provider(ExecutionProviderKind::Cpu));
+        let selected_contract = selected_backend_contract().unwrap_or_else(|| {
+            crate::provider::BackendContractDescriptor::for_provider(ExecutionProviderKind::Cpu)
+        });
         let provider = selected_contract.provider;
         Ok(Self {
             model_id: model.model_id().to_string(),

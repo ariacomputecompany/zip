@@ -24,7 +24,7 @@ work, return lease metadata, and persist global scheduler state.
 - session-local runtime state
 - provider selection and execution backend wiring
 - batch formation inside a worker
-- checkpoint serialization and import/export
+- live-KV handoff export/import plus durable checkpoint recovery
 - tensor-plane and collective transport
 - local resource and memory management
 
@@ -71,7 +71,7 @@ This is the runtime core.
 
 ### `checkpoint`
 
-This module is the durable handoff boundary.
+This module is the durable recovery boundary.
 
 - `types.rs`
   Defines checkpoint metadata, KV residency metadata, payload references, and
@@ -83,8 +83,12 @@ This module is the durable handoff boundary.
 The checkpoint format is used for:
 
 - same-worker recovery after local runtime loss
-- cross-worker decode continuation after prefill handoff
-- durable KV state exchange when live remote KV is not available
+- cold-path cross-worker recovery when live KV handoff is unavailable
+
+Live cross-worker continuation is not modeled as a checkpoint export. The
+runtime uses an explicit live-KV handoff envelope that carries session request
+state plus resident KV snapshot materialization for direct import into the
+target runtime.
 
 ### `network`
 
@@ -191,8 +195,11 @@ Prefill loads prompt state, runs the first forward pass, and can produce:
 
 ### 3. Handoff boundary
 
-If execution moves or local runtime state must survive process loss, the runtime
-serializes checkpoint state through the checkpoint manager.
+If execution moves while live runtime state is still resident, the runtime
+exports an explicit live-KV handoff envelope and the target runtime hydrates it
+directly into resident session state. If execution must survive process loss or
+durable recovery is required, the runtime falls back to checkpoint persistence
+through the checkpoint manager.
 
 ### 4. Decode queue admission
 
