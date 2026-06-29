@@ -10,8 +10,8 @@ use crate::errors::{AgentError, Result};
 use crate::provider::ExecutionProviderKind;
 
 use super::engine::{BackendOptimizationProfile, ExecutionPhase};
+use super::kv_cache::DEFAULT_LIVE_KV_PAGE_TOKENS;
 
-const KV_PAGE_TOKENS: usize = 16;
 const DECODE_BUCKET_BATCHES: &[usize] = &[1, 2, 4, 8];
 const DECODE_BUCKET_KV_TOKENS: &[usize] = &[2_048, 8_192, 16_384, 32_768, 65_536];
 const PREFILL_BUCKET_TOKENS: &[usize] = &[128, 512, 2_048, 8_192, 16_384];
@@ -454,7 +454,7 @@ impl FastPathPlanner {
     }
 
     fn metadata_fields(bucket: &FastPathBucketKey) -> Vec<MetadataFieldLayout> {
-        let page_slots = bucket.token_ceiling.div_ceil(KV_PAGE_TOKENS);
+        let page_slots = bucket.token_ceiling.div_ceil(DEFAULT_LIVE_KV_PAGE_TOKENS);
         vec![
             MetadataFieldLayout {
                 name: "slot_sequence_lengths".to_string(),
